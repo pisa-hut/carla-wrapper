@@ -6,7 +6,6 @@ from pathlib import Path
 import os
 import math
 from google.protobuf.json_format import MessageToDict
-from pprint import pprint
 
 import carla
 
@@ -29,8 +28,10 @@ from srunner.scenarioconfigs.openscenario_configuration import (
 from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 from srunner.scenariomanager.timer import GameTime
 from srunner.scenarios.open_scenario import OpenScenario
+from srunner.scenarios.route_scenario import RouteScenario
 from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 from srunner.scenariomanager.timer import GameTime
+from srunner.tools.route_parser import RouteParser
 import py_trees
 
 import logging
@@ -72,9 +73,8 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
         return Pong(msg="CARLA alive")
 
     def Init(self, request, context):
-        self.config = request.config.config
         self.config = MessageToDict(request.config.config)
-        pprint(self.config)
+        self.scenario = request.scenario
         self._connect()
 
         # self._client.set_timeout(float(self.config.get("timeout", 2.0)))
@@ -125,7 +125,7 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
 
         if self._ego_vehicle is None:
             logger.warning("Ego vehicle not found after waiting, spawning ego...")
-            self._spawn_ego(request.scenario_pack)
+            # self._spawn_ego(request.scenario_pack)
 
         if self._sync:
             self._world.tick()
@@ -266,7 +266,7 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
         self._prev_yaw_rate.clear()
 
     def _spawn_ego(self, sps: ScenarioPack):
-        input("Press Enter to spawn ego vehicle...")
+        # input("Press Enter to spawn ego vehicle...")
         if self._world is None:
             raise RuntimeError("CARLA world not available")
 
@@ -282,7 +282,7 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
         if ego_bp.has_attribute("role_name"):
             ego_bp.set_attribute("role_name", self._ego_role_name)
 
-        pos = sps.ego.spawn.position
+        pos = sps.ego.spawn_config.position
         loc = carla.Location(
             x=float(pos.x),
             y=float(pos.y) * self._yaw_sign,
@@ -343,47 +343,71 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
         if self._sync:
             tm.set_synchronous_mode(True)
 
-        openscenario_params: dict[str, str] = {}
-        if params:
-            openscenario_params = {str(k): str(v) for k, v in params.items()}
+        match self.scenario.type:
+            case "openscenario":
+                openscenario_params: dict[str, str] = {}
+                if params:
+                    openscenario_params = {str(k): str(v) for k, v in params.items()}
+                xosc_name = sps.name
+                xosc_path = Path(f"/mnt/scenario/{xosc_name}.xosc").resolve()
+                if xosc_path is None:
+                    raise RuntimeError("ScenarioPack has no xosc scenario to run")
 
-        xosc_name = sps.name
-        xosc_path = Path(f"/mnt/scenario/{xosc_name}.xosc").resolve()
-        if xosc_path is None:
-            raise RuntimeError("ScenarioPack has no xosc scenario to run")
-        config = OpenScenarioConfiguration(
-            str(xosc_path), self._client, openscenario_params
-        )
-
-        ego_vehicles = []
-        for ego_config in config.ego_vehicles:
-            actor = CarlaDataProvider.request_new_actor(
-                ego_config.model,
-                ego_config.transform,
-                ego_config.rolename,
-                random_location=ego_config.random_location,
-                color=ego_config.color,
-                actor_category=ego_config.category,
-            )
-            if actor is None:
-                raise RuntimeError(
-                    f"Failed to spawn ego vehicle '{ego_config.rolename}'"
+                config = OpenScenarioConfiguration(
+                    str(xosc_path), self._client, openscenario_params
                 )
-            ego_vehicles.append(actor)
 
-        scenario = OpenScenario(
-            world=self._world,
-            ego_vehicles=ego_vehicles,
-            config=config,
-            config_file=str(xosc_path),
-            timeout=sps.timeout_ns / 1e9 if sps.timeout_ns > 0 else 10000.0,
-        )
+            case "route":
+                route_name = self.scenario.name
+                xml_path = os.path.join(self.scenario.path.path, f"{route_name}.xml")
+                # TODO: route id
+                config = RouteParser.parse_routes_file(xml_path, 0)
+                logger.info(f"Parsed route scenario config: {config}")
+                config = config[0]
+
+            case _:
+                raise RuntimeError(f"Unsupported scenario type: {self.scenario.type}")
+
+        match self.scenario.type:
+            case "openscenario":
+                ego_vehicles = []
+                for ego_config in config.ego_vehicles:
+                    actor = CarlaDataProvider.request_new_actor(
+                        ego_config.model,
+                        ego_config.transform,
+                        ego_config.rolename,
+                        random_location=ego_config.random_location,
+                        color=ego_config.color,
+                        actor_category=ego_config.category,
+                    )
+                    if actor is None:
+                        raise RuntimeError(
+                            f"Failed to spawn ego vehicle '{ego_config.rolename}'"
+                        )
+                    ego_vehicles.append(actor)
+                logger.debug(f"Spawned {len(ego_vehicles)} ego vehicles for scenario")
+
+                scenario = OpenScenario(
+                    world=self._world,
+                    ego_vehicles=ego_vehicles,
+                    config=config,
+                    config_file=str(xosc_path),
+                    timeout=sps.timeout_ns / 1e9 if sps.timeout_ns > 0 else 10000.0,
+                )
+
+                self._sr_ego_vehicles = ego_vehicles
+                self._ego_vehicle = ego_vehicles[0]
+
+            case "route":
+                scenario = RouteScenario(world=self._world, config=config)
+                # self._sr_ego_vehicles = scenario.ego_vehicles
+                self._ego_vehicle = scenario.ego_vehicles[0]
+
+            case _:
+                raise RuntimeError(f"Unsupported scenario type: {self.scenario.type}")
 
         self._sr_scenario = scenario
         self._sr_tree = scenario.scenario_tree
-
-        self._sr_ego_vehicles = ego_vehicles
-        self._ego_vehicle = ego_vehicles[0] if ego_vehicles else None
 
         GameTime.restart()
         self._sr_running = True
@@ -602,6 +626,8 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
 
         self._time_ns = sim_time_ns
 
+        logger.debug(f"Collected {len(objects)} objects at time {sim_time_ns} ns")
+
         return objects
 
     def _apply_ctrl(self, ctrl: CtrlCmd, dt_s: float) -> None:
@@ -698,13 +724,13 @@ def serve():
     server.add_insecure_port(f"[::]:{PORT}")
     server.start()
 
-    print(f"gRPC server running on port {PORT}")
+    logger.info(f"CARLA gRPC server started on port {PORT}. Waiting for clients...")
 
     try:
         while True:
             time.sleep(86400)
     except KeyboardInterrupt:
-        print("Shutting down")
+        logger.info("Shutting down CARLA gRPC server...")
         server.stop(0)
 
 

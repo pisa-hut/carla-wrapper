@@ -2,6 +2,7 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN usermod -l carla ubuntu
+RUN groupmod -n carla ubuntu
 
 COPY --from=docker.io/tonychi/carla:0.9.16 --chown=carla:carla /opt/carla /opt/carla
 
