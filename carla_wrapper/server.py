@@ -1,3 +1,4 @@
+import subprocess
 import grpc
 from concurrent import futures
 import time
@@ -57,6 +58,12 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
 
         self._objects_by_id = {}
         self._prev_yaw_rate = {}
+
+        subprocess.Popen(
+            ["/app/carla_server.sh"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
         while self._world is None:
             try:
@@ -664,6 +671,8 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
             return
 
         elif ctrl.mode == CtrlMode.ACKERMANN:
+            steer_speed = float(payload.get("steer_speed", 0.0))
+
             steer = float(payload.get("steer", 0.0)) * self._yaw_sign
             speed = float(
                 payload.get("speed", self._get_forward_speed(self._ego_vehicle))
@@ -684,14 +693,14 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
             else:
                 steer = _clamp(steer, -1.0, 1.0)
 
-            cur_speed = self._get_forward_speed(self._ego_vehicle)
-            kp = float(self.config.get("speed_kp", 1))
-            kb = float(self.config.get("brake_kp", kp))
-            speed_err = speed - cur_speed
-            throttle = _clamp(speed_err * kp, 0.0, 1.0)
-            brake = _clamp(-speed_err * kb, 0.0, 1.0)
-            control = carla.VehicleControl(throttle=throttle, steer=steer, brake=brake)
-            self._ego_vehicle.apply_control(control)
+            control = carla.VehicleAckermannControl(
+                steer=steer,
+                steer_speed=steer_speed,
+                speed=speed,
+                acceleration=acceleration,
+                jerk=jerk,
+            )
+            self._ego_vehicle.apply_ackermann_control(control)
             return
 
         elif ctrl.mode == CtrlMode.POSITION:
