@@ -350,8 +350,8 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
         if self._sync:
             tm.set_synchronous_mode(True)
 
-        match self.scenario.type:
-            case "openscenario":
+        match self.scenario.format:
+            case "OpenScenario1":
                 openscenario_params: dict[str, str] = {}
                 if params:
                     openscenario_params = {str(k): str(v) for k, v in params.items()}
@@ -364,7 +364,7 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
                     str(xosc_path), self._client, openscenario_params
                 )
 
-            case "route":
+            case "CarlaLBRoute":
                 route_name = self.scenario.name
                 xml_path = os.path.join(self.scenario.path.path, f"{route_name}.xml")
                 # TODO: route id
@@ -375,8 +375,8 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
             case _:
                 raise RuntimeError(f"Unsupported scenario type: {self.scenario.type}")
 
-        match self.scenario.type:
-            case "openscenario":
+        match self.scenario.format:
+            case "OpenScenario1":
                 ego_vehicles = []
                 for ego_config in config.ego_vehicles:
                     actor = CarlaDataProvider.request_new_actor(
@@ -405,13 +405,15 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
                 self._sr_ego_vehicles = ego_vehicles
                 self._ego_vehicle = ego_vehicles[0]
 
-            case "route":
+            case "CarlaLBRoute":
                 scenario = RouteScenario(world=self._world, config=config)
                 # self._sr_ego_vehicles = scenario.ego_vehicles
                 self._ego_vehicle = scenario.ego_vehicles[0]
 
             case _:
-                raise RuntimeError(f"Unsupported scenario type: {self.scenario.type}")
+                raise RuntimeError(
+                    f"Unsupported scenario format: {self.scenario.format}"
+                )
 
         self._sr_scenario = scenario
         self._sr_tree = scenario.scenario_tree
