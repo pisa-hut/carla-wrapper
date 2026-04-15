@@ -364,7 +364,7 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
                     str(xosc_path), self._client, openscenario_params
                 )
 
-            case "CarlaLBRoute":
+            case "CarlaLbRoute":
                 route_name = self.scenario.name
                 xml_path = os.path.join(self.scenario.path.path, f"{route_name}.xml")
                 # TODO: route id
@@ -373,7 +373,9 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
                 config = config[0]
 
             case _:
-                raise RuntimeError(f"Unsupported scenario type: {self.scenario.type}")
+                raise RuntimeError(
+                    f"Unsupported scenario format: {self.scenario.format}"
+                )
 
         match self.scenario.format:
             case "OpenScenario1":
@@ -405,7 +407,7 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
                 self._sr_ego_vehicles = ego_vehicles
                 self._ego_vehicle = ego_vehicles[0]
 
-            case "CarlaLBRoute":
+            case "CarlaLbRoute":
                 scenario = RouteScenario(world=self._world, config=config)
                 # self._sr_ego_vehicles = scenario.ego_vehicles
                 self._ego_vehicle = scenario.ego_vehicles[0]
@@ -738,8 +740,7 @@ def serve():
     logger.info(f"CARLA gRPC server started on port {PORT}. Waiting for clients...")
 
     try:
-        while True:
-            time.sleep(86400)
+        server.wait_for_termination()
     except KeyboardInterrupt:
         logger.info("Shutting down CARLA gRPC server...")
         server.stop(0)
