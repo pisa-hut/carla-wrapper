@@ -22,5 +22,25 @@ dependencies = [
     "xmlschema==1.0.18",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
 [tool.uv.sources]
-pisa-api = { git = "https://github.com/PISA-Hut/pisa-api.git" }
+pisa-api = { git = "https://github.com/pisa-hut/pisa-api.git" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+# scenario_runner is a vendored CARLA dependency, not source we
+# maintain; lint it would churn hundreds of issues per release.
+extend-exclude = ["scenario_runner/"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
