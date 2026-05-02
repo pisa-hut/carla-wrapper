@@ -111,7 +111,10 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
         self._time_ns = 0
         self._quit_flag = False
 
-        # self._ensure_world(request.scenario_pack)
+        # `_connect()` no longer populates `_world` (it only probes
+        # `get_server_version`), so without this call `_world` is None
+        # and `self._world.tick()` below crashes on the first Reset.
+        self._ensure_world(request.scenario_pack)
         self._apply_world_settings()
         self._destroy_spawned_actors()
         self._stop_scenario_runner_module()
@@ -160,6 +163,10 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
         self._ego_vehicle = None
         self._world = None
         self._client = None
+        # Clear `_server_version` too — it's the reconnection guard in
+        # `_connect()`, so a follow-up `Init` after this Stop would
+        # short-circuit the connect and leave `_client` as None.
+        self._server_version = None
         logger.info("CARLA simulator stopped.")
         return Empty()
 
