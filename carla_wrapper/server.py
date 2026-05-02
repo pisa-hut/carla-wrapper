@@ -1,28 +1,27 @@
-import subprocess
-import grpc
-from concurrent import futures
-import time
-from typing import Optional
-from pathlib import Path
-import os
+import logging
 import math
-from google.protobuf.json_format import MessageToDict
+import os
+import subprocess
+import time
+from concurrent import futures
+from pathlib import Path
 
 import carla
-
+import grpc
+import py_trees
+from google.protobuf.json_format import MessageToDict
 from pisa_api import sim_server_pb2, sim_server_pb2_grpc
-from pisa_api.pong_pb2 import Pong
+from pisa_api.control_pb2 import CtrlCmd, CtrlMode
 from pisa_api.empty_pb2 import Empty
-from pisa_api.scenario_pb2 import ScenarioPack
 from pisa_api.object_pb2 import (
-    ObjectState,
     ObjectKinematic,
+    ObjectState,
+    RoadObjectType,
     Shape,
     ShapeType,
-    RoadObjectType,
 )
-from pisa_api.control_pb2 import CtrlCmd, CtrlMode
-
+from pisa_api.pong_pb2 import Pong
+from pisa_api.scenario_pb2 import ScenarioPack
 from srunner.scenarioconfigs.openscenario_configuration import (
     OpenScenarioConfiguration,
 )
@@ -30,12 +29,7 @@ from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 from srunner.scenariomanager.timer import GameTime
 from srunner.scenarios.open_scenario import OpenScenario
 from srunner.scenarios.route_scenario import RouteScenario
-from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
-from srunner.scenariomanager.timer import GameTime
 from srunner.tools.route_parser import RouteParser
-import py_trees
-
-import logging
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -52,6 +46,7 @@ def _clamp(value: float, min_value: float, max_value: float) -> float:
 class CarlaService(sim_server_pb2_grpc.SimServerServicer):
     def __init__(self):
         self._client = None
+        self._server_version = None
         self._world = None
         self.config = None
         self._original_settings = None
@@ -65,7 +60,7 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
             stderr=subprocess.DEVNULL,
         )
 
-        while self._world is None:
+        while self._server_version is None:
             try:
                 self._connect()
             except Exception:
@@ -95,34 +90,31 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
         self._spawn_z_offset = float(self.config.get("spawn_z_offset", 3.0))
 
         self._ego_bp_id = self.config.get("ego_vehicle_bp", "vehicle.tesla.model3")
-        self._max_steer_rad: Optional[float] = None
+        self._max_steer_rad: float | None = None
         self._quit_flag = False
 
         self._spawned_actor_ids: set[int] = set()
         self._scenario_runner_path = self.config.get("scenario_runner_path", None)
         self._ego_role_name = self.config.get("ego_role_name", "hero")
-        self._scenario_runner_tm_port = int(
-            self.config.get("scenario_runner_tm_port", 8000)
-        )
-        self._scenario_runner_tm_seed = int(
-            self.config.get("scenario_runner_tm_seed", 0)
-        )
+        self._scenario_runner_tm_port = int(self.config.get("scenario_runner_tm_port", 8000))
+        self._scenario_runner_tm_seed = int(self.config.get("scenario_runner_tm_seed", 0))
 
         self._sr_scenario = None
         self._sr_tree = None
         self._sr_running = False
         self._sr_ego_vehicles: list = []
 
-        return sim_server_pb2.SimServerMessages.InitResponse(
-            success=True, msg="CARLA initialized"
-        )
+        return sim_server_pb2.SimServerMessages.InitResponse(success=True, msg="CARLA initialized")
 
     def Reset(self, request, context):
         self._output_dir = request.output_dir
         self._time_ns = 0
         self._quit_flag = False
 
-        # self._ensure_world(request.scenario_pack)
+        # `_connect()` no longer populates `_world` (it only probes
+        # `get_server_version`), so without this call `_world` is None
+        # and `self._world.tick()` below crashes on the first Reset.
+        self._ensure_world(request.scenario_pack)
         self._apply_world_settings()
         self._destroy_spawned_actors()
         self._stop_scenario_runner_module()
@@ -171,29 +163,27 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
         self._ego_vehicle = None
         self._world = None
         self._client = None
+        # Clear `_server_version` too — it's the reconnection guard in
+        # `_connect()`, so a follow-up `Init` after this Stop would
+        # short-circuit the connect and leave `_client` as None.
+        self._server_version = None
         logger.info("CARLA simulator stopped.")
         return Empty()
 
     def ShouldQuit(self, request, context):
-        return sim_server_pb2.SimServerMessages.ShouldQuitResponse(
-            should_quit=self._quit_flag
-        )
+        return sim_server_pb2.SimServerMessages.ShouldQuitResponse(should_quit=self._quit_flag)
 
     def _connect(self):
-        if self._world is None:
-            print("Connecting to CARLA...")
-            self._client = carla.Client(
-                os.environ.get("CARLA_HOST", "localhost"),
-                int(os.environ.get("CARLA_PORT", 2000)),
-            )
-            self._client.set_timeout(float(os.environ.get("CARLA_TIMEOUT", 10.0)))
-            self._world = self._client.get_world()
-            setting = self._world.get_settings()
-            setting.no_rendering_mode = True
-            setting.synchronous_mode = True
-            self._world.apply_settings(setting)
-            print("Connected to CARLA")
-        print(f"Carla version: {self._client.get_server_version()}")
+        if self._server_version is not None:
+            return
+        print("Connecting to CARLA...")
+        self._client = carla.Client(
+            os.environ.get("CARLA_HOST", "localhost"),
+            int(os.environ.get("CARLA_PORT", 2000)),
+        )
+        self._client.set_timeout(float(os.environ.get("CARLA_TIMEOUT", 10.0)))
+        self._server_version = self._client.get_server_version()
+        print("Connected to CARLA")
 
     def _to_carla_yaw(self, yaw_rad: float) -> float:
         return self._yaw_sign * math.degrees(yaw_rad) + self._yaw_offset_deg
@@ -201,7 +191,7 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
     def _from_carla_yaw(self, yaw_deg: float) -> float:
         return math.radians((yaw_deg - self._yaw_offset_deg) * self._yaw_sign)
 
-    def _ensure_world(self, sps: Optional[ScenarioPack]) -> None:
+    def _ensure_world(self, sps: ScenarioPack | None) -> None:
         if self._client is None:
             self._connect()
 
@@ -215,19 +205,17 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
         elif opendrive_path and hasattr(self._client, "generate_opendrive_world"):
             opendrive_path = Path(opendrive_path)
             if not opendrive_path.exists():
-                raise RuntimeError(
-                    "OpenDRIVE path not found for CARLA world generation"
-                )
+                raise RuntimeError("OpenDRIVE path not found for CARLA world generation")
 
             # read opendrive file
-            with open(opendrive_path, "r", encoding="utf-8") as f:
+            with open(opendrive_path, encoding="utf-8") as f:
                 opendrive_str = f.read()
             world = self._client.generate_opendrive_world(
                 opendrive_str,
                 carla.OpendriveGenerationParameters(
                     vertex_distance=2.0,
-                    max_road_length=3000.0,
-                    wall_height=10.0,
+                    max_road_length=500.0,
+                    wall_height=0.0,
                     additional_width=0.6,
                     smooth_junctions=True,
                     enable_mesh_visibility=True,
@@ -280,10 +268,10 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
         bp_lib = self._world.get_blueprint_library()
         try:
             ego_bp = bp_lib.find(self._ego_bp_id)
-        except Exception:
+        except Exception as exc:
             candidates = bp_lib.filter("vehicle.*")
             if not candidates:
-                raise RuntimeError("No vehicle blueprints available in CARLA")
+                raise RuntimeError("No vehicle blueprints available in CARLA") from exc
             ego_bp = candidates[0]
 
         if ego_bp.has_attribute("role_name"):
@@ -322,22 +310,17 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
         except Exception:
             self._max_steer_rad = None
 
-    def _start_scenario_runner(self, sps: ScenarioPack, params: Optional[dict]) -> None:
+    def _start_scenario_runner(self, sps: ScenarioPack, params: dict | None) -> None:
         if self._scenario_runner_path is None:
-            raise RuntimeError(
-                "scenario_runner_path is required when use_scenario_runner"
-            )
+            raise RuntimeError("scenario_runner_path is required when use_scenario_runner")
 
         sr_path = Path(self._scenario_runner_path)
-        if sr_path.is_dir():
-            sr_script = sr_path / "scenario_runner.py"
-        else:
-            sr_script = sr_path
+        sr_script = sr_path / "scenario_runner.py" if sr_path.is_dir() else sr_path
 
         self._start_scenario_runner_module(sps, params, sr_script)
 
     def _start_scenario_runner_module(
-        self, sps: ScenarioPack, params: Optional[dict], sr_script: Path
+        self, sps: ScenarioPack, params: dict | None, sr_script: Path
     ) -> None:
         if self._client is None or self._world is None:
             raise RuntimeError("CARLA client/world not available")
@@ -373,9 +356,7 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
                 config = config[0]
 
             case _:
-                raise RuntimeError(
-                    f"Unsupported scenario format: {self.scenario.format}"
-                )
+                raise RuntimeError(f"Unsupported scenario format: {self.scenario.format}")
 
         match self.scenario.format:
             case "open_scenario1":
@@ -390,9 +371,7 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
                         actor_category=ego_config.category,
                     )
                     if actor is None:
-                        raise RuntimeError(
-                            f"Failed to spawn ego vehicle '{ego_config.rolename}'"
-                        )
+                        raise RuntimeError(f"Failed to spawn ego vehicle '{ego_config.rolename}'")
                     ego_vehicles.append(actor)
                 logger.debug(f"Spawned {len(ego_vehicles)} ego vehicles for scenario")
 
@@ -413,9 +392,7 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
                 self._ego_vehicle = scenario.ego_vehicles[0]
 
             case _:
-                raise RuntimeError(
-                    f"Unsupported scenario format: {self.scenario.format}"
-                )
+                raise RuntimeError(f"Unsupported scenario format: {self.scenario.format}")
 
         self._sr_scenario = scenario
         self._sr_tree = scenario.scenario_tree
@@ -424,11 +401,7 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
         self._sr_running = True
 
     def _stop_scenario_runner_module(self) -> None:
-        if (
-            self._sr_scenario is None
-            and self._sr_tree is None
-            and not self._sr_ego_vehicles
-        ):
+        if self._sr_scenario is None and self._sr_tree is None and not self._sr_ego_vehicles:
             logger.info("ScenarioRunner not running, no need to stop")
             return
 
@@ -494,7 +467,6 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
         CarlaDataProvider.on_carla_tick()
         self._sr_tree.tick_once()
         if self._sr_tree.status != py_trees.common.Status.RUNNING:
-
             self._sr_running = False
             self._quit_flag = True
 
@@ -678,9 +650,7 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
             steer_speed = float(payload.get("steer_speed", 0.0))
 
             steer = float(payload.get("steer", 0.0)) * self._yaw_sign
-            speed = float(
-                payload.get("speed", self._get_forward_speed(self._ego_vehicle))
-            )
+            speed = float(payload.get("speed", self._get_forward_speed(self._ego_vehicle)))
             acceleration = payload.get("acceleration", None)
             if acceleration is None:
                 acceleration = float(self.config.get("ackermann_accel_default", 1.5))
