@@ -3,14 +3,12 @@ import math
 import os
 import subprocess
 import time
-from concurrent import futures
 from pathlib import Path
 
 import carla
-import grpc
 import py_trees
 from google.protobuf.json_format import MessageToDict
-from pisa_api import sim_server_pb2, sim_server_pb2_grpc
+from pisa_api import sim_server_pb2
 from pisa_api.control_pb2 import CtrlCmd, CtrlMode
 from pisa_api.empty_pb2 import Empty
 from pisa_api.object_pb2 import (
@@ -20,8 +18,8 @@ from pisa_api.object_pb2 import (
     Shape,
     ShapeType,
 )
-from pisa_api.pong_pb2 import Pong
 from pisa_api.scenario_pb2 import ScenarioPack
+from pisa_api.wrapper import BaseSimServer, serve_sim, setup_logging
 from srunner.scenarioconfigs.openscenario_configuration import (
     OpenScenarioConfiguration,
 )
@@ -31,19 +29,17 @@ from srunner.scenarios.open_scenario import OpenScenario
 from srunner.scenarios.route_scenario import RouteScenario
 from srunner.tools.route_parser import RouteParser
 
+setup_logging()
 logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler()],
-)
 
 
 def _clamp(value: float, min_value: float, max_value: float) -> float:
     return max(min_value, min(max_value, value))
 
 
-class CarlaService(sim_server_pb2_grpc.SimServerServicer):
+class CarlaService(BaseSimServer):
+    _name = "CARLA"
+
     def __init__(self):
         self._client = None
         self._server_version = None
@@ -69,10 +65,6 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
                 continue
             break
         print("CARLA service initialized")
-
-    def Ping(self, request, context):
-        logger.info(f"Received ping from client: {context.peer()}")
-        return Pong(msg="CARLA alive")
 
     def Init(self, request, context):
         self.config = MessageToDict(request.config.config)
@@ -697,24 +689,5 @@ class CarlaService(sim_server_pb2_grpc.SimServerServicer):
         logger.warning("Unsupported control mode: %s", ctrl.mode)
 
 
-def serve():
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
-
-    sim_server_pb2_grpc.add_SimServerServicer_to_server(CarlaService(), server)
-
-    PORT = os.environ.get("PORT", "50051")
-
-    server.add_insecure_port(f"[::]:{PORT}")
-    server.start()
-
-    logger.info(f"CARLA gRPC server started on port {PORT}. Waiting for clients...")
-
-    try:
-        server.wait_for_termination()
-    except KeyboardInterrupt:
-        logger.info("Shutting down CARLA gRPC server...")
-        server.stop(0)
-
-
 if __name__ == "__main__":
-    serve()
+    serve_sim(CarlaService(), name="CARLA")
