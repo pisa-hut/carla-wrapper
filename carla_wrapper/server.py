@@ -121,10 +121,10 @@ class CarlaService(BaseSimServer):
         self._ensure_world(request.scenario_pack)
         self._apply_world_settings()
 
+        p = str((self._output_dir / "carla_recording.log").resolve())
+        self._client.start_recorder(p)
         logger.info("Starting ScenarioRunner...")
         self._start_scenario_runner(request.scenario_pack, request.params)
-
-        self._client.start_recorder(str(self._output_dir / "carla_recording.log"))
 
         if self._ego_vehicle is None:
             logger.warning("Ego vehicle not found after waiting, spawning ego...")

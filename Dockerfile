@@ -34,7 +34,7 @@ RUN uv sync --locked
 RUN uv add /opt/carla/PythonAPI/carla/dist/carla-0.9.16-cp310-cp310-linux_x86_64.whl
 RUN uv add -r /opt/scenario_runner/requirements.txt
 ENV PYTHONPATH=/opt/scenario_runner/:/opt/carla/PythonAPI/carla/
-COPY . .
+COPY --chown=carla:carla  . .
 
 ENV PORT=50051
 ENV CARLA_PORT=2000

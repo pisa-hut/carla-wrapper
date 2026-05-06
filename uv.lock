@@ -28,6 +28,7 @@ dependencies = [
     { name = "pisa-api" },
     { name = "psutil" },
     { name = "py-trees" },
+    { name = "rich" },
     { name = "shapely" },
     { name = "simple-watchdog-timer" },
     { name = "six" },
@@ -53,6 +54,7 @@ requires-dist = [
     { name = "pisa-api", git = "https://github.com/pisa-hut/pisa-api.git" },
     { name = "psutil", specifier = ">=7.2.2" },
     { name = "py-trees", specifier = "==0.8.3" },
+    { name = "rich", specifier = ">=15.0.0" },
     { name = "shapely", specifier = "==2.1.1" },
     { name = "simple-watchdog-timer", specifier = ">=0.1.1" },
     { name = "six", specifier = ">=1.17.0" },
@@ -232,6 +234,18 @@ wheels = [
 ]
 
 [[package]]
+name = "markdown-it-py"
+version = "4.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "mdurl" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5b/f5/4ec618ed16cc4f8fb3b701563655a69816155e79e24a17b651541804721d/markdown_it_py-4.0.0.tar.gz", hash = "sha256:cb0a2b4aa34f932c007117b194e945bd74e0ec24133ceb5bac59009cda1cb9f3", size = 73070, upload-time = "2025-08-11T12:57:52.854Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/94/54/e7d793b573f298e1c9013b8c4dade17d481164aa517d1d7148619c2cedbf/markdown_it_py-4.0.0-py3-none-any.whl", hash = "sha256:87327c59b172c5011896038353a81343b6754500a08cd7a4973bb48c6d578147", size = 87321, upload-time = "2025-08-11T12:57:51.923Z" },
+]
+
+[[package]]
 name = "matplotlib"
 version = "3.10.9"
 source = { registry = "https://pypi.org/simple" }
@@ -257,6 +271,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/2c/2b/0e92ad0ac446633f928a1563db4aa8add407e1924faf0ded5b95b35afb27/matplotlib-3.10.9-pp310-pypy310_pp73-macosx_10_15_x86_64.whl", hash = "sha256:1872fb212a05b729e649754a72d5da61d03e0554d76e80303b6f83d1d2c0552b", size = 8293058, upload-time = "2026-04-24T00:13:56.339Z" },
     { url = "https://files.pythonhosted.org/packages/4b/23/74682fd369f5299ceda438fea2a0662e6383b85c9383fb9cdfcf04713e07/matplotlib-3.10.9-pp310-pypy310_pp73-macosx_11_0_arm64.whl", hash = "sha256:985f2238880e2e69093f588f5fe2e46771747febf0649f3cf7f7b7480875317f", size = 8186627, upload-time = "2026-04-24T00:13:58.623Z" },
     { url = "https://files.pythonhosted.org/packages/ca/e8/368aab88f3c4cd8992800f31abfe0670c3e47540ba20a97e9fdbcde594b3/matplotlib-3.10.9-pp310-pypy310_pp73-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:6640f75af2c6148293caa0a2b39dd806a492dd66c8a8b04035813e33d0fd2585", size = 8764117, upload-time = "2026-04-24T00:14:01.684Z" },
+]
+
+[[package]]
+name = "mdurl"
+version = "0.1.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d6/54/cfe61301667036ec958cb99bd3efefba235e65cdeb9c84d24a8293ba1d90/mdurl-0.1.2.tar.gz", hash = "sha256:bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba", size = 8729, upload-time = "2022-08-14T12:40:10.846Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b3/38/89ba8ad64ae25be8de66a6d463314cf1eb366222074cfda9ee839c56a4b4/mdurl-0.1.2-py3-none-any.whl", hash = "sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8", size = 9979, upload-time = "2022-08-14T12:40:09.779Z" },
 ]
 
 [[package]]
@@ -447,6 +470,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/66/c0/0c8b6ad9f17a802ee498c46e004a0eb49bc148f2fd230864601a86dcf6db/python-dateutil-2.9.0.post0.tar.gz", hash = "sha256:37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3", size = 342432, upload-time = "2024-03-01T18:36:20.211Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ec/57/56b9bcc3c9c6a792fcbaf139543cee77261f3651ca9da0c93f5c1221264b/python_dateutil-2.9.0.post0-py2.py3-none-any.whl", hash = "sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427", size = 229892, upload-time = "2024-03-01T18:36:18.57Z" },
+]
+
+[[package]]
+name = "rich"
+version = "15.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "markdown-it-py" },
+    { name = "pygments" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c0/8f/0722ca900cc807c13a6a0c696dacf35430f72e0ec571c4275d2371fca3e9/rich-15.0.0.tar.gz", hash = "sha256:edd07a4824c6b40189fb7ac9bc4c52536e9780fbbfbddf6f1e2502c31b068c36", size = 230680, upload-time = "2026-04-12T08:24:00.75Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/82/3b/64d4899d73f91ba49a8c18a8ff3f0ea8f1c1d75481760df8c68ef5235bf5/rich-15.0.0-py3-none-any.whl", hash = "sha256:33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb", size = 310654, upload-time = "2026-04-12T08:24:02.83Z" },
 ]
 
 [[package]]
