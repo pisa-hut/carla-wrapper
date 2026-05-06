@@ -88,15 +88,21 @@ class CarlaService(BaseSimServer):
         self._spawned_actor_ids: set[int] = set()
         self._scenario_runner_path = self.config.get("scenario_runner_path", None)
         self._ego_role_name = self.config.get("ego_role_name", "hero")
-        self._scenario_runner_tm_port = int(self.config.get("scenario_runner_tm_port", 8000))
-        self._scenario_runner_tm_seed = int(self.config.get("scenario_runner_tm_seed", 0))
+        self._scenario_runner_tm_port = int(
+            self.config.get("scenario_runner_tm_port", 8000)
+        )
+        self._scenario_runner_tm_seed = int(
+            self.config.get("scenario_runner_tm_seed", 0)
+        )
 
         self._sr_scenario = None
         self._sr_tree = None
         self._sr_running = False
         self._sr_ego_vehicles: list = []
 
-        return sim_server_pb2.SimServerMessages.InitResponse(success=True, msg="CARLA initialized")
+        return sim_server_pb2.SimServerMessages.InitResponse(
+            success=True, msg="CARLA initialized"
+        )
 
     def Reset(self, request, context):
         self._output_dir = request.output_dir
@@ -163,7 +169,9 @@ class CarlaService(BaseSimServer):
         return Empty()
 
     def ShouldQuit(self, request, context):
-        return sim_server_pb2.SimServerMessages.ShouldQuitResponse(should_quit=self._quit_flag)
+        return sim_server_pb2.SimServerMessages.ShouldQuitResponse(
+            should_quit=self._quit_flag
+        )
 
     def _connect(self):
         if self._server_version is not None:
@@ -197,22 +205,35 @@ class CarlaService(BaseSimServer):
         elif opendrive_path and hasattr(self._client, "generate_opendrive_world"):
             opendrive_path = Path(opendrive_path)
             if not opendrive_path.exists():
-                raise RuntimeError("OpenDRIVE path not found for CARLA world generation")
+                raise RuntimeError(
+                    "OpenDRIVE path not found for CARLA world generation"
+                )
 
             # read opendrive file
             with open(opendrive_path, encoding="utf-8") as f:
                 opendrive_str = f.read()
-            world = self._client.generate_opendrive_world(
-                opendrive_str,
-                carla.OpendriveGenerationParameters(
-                    vertex_distance=2.0,
-                    max_road_length=500.0,
-                    wall_height=0.0,
-                    additional_width=0.6,
-                    smooth_junctions=True,
-                    enable_mesh_visibility=True,
-                ),
-            )
+            # OpenDRIVE world generation can take minutes — bump the
+            # client timeout, but guarantee it gets restored even if
+            # generation raises (otherwise every subsequent CARLA call
+            # on this client inherits the inflated 300s timeout).
+            default_timeout = float(os.environ.get("CARLA_TIMEOUT", 10.0))
+            self._client.set_timeout(300.0)
+            try:
+                logger.info("Generating CARLA world from OpenDRIVE: %s", opendrive_path)
+                world = self._client.generate_opendrive_world(
+                    opendrive_str,
+                    carla.OpendriveGenerationParameters(
+                        vertex_distance=2.0,
+                        # max_road_length=500.0,
+                        wall_height=0.0,
+                        additional_width=5.6,
+                        smooth_junctions=True,
+                        enable_mesh_visibility=True,
+                    ),
+                )
+                logger.info("Generated CARLA world from OpenDRIVE: %s", opendrive_path)
+            finally:
+                self._client.set_timeout(default_timeout)
         else:
             raise RuntimeError("Cannot determine CARLA world to load")
 
@@ -304,7 +325,9 @@ class CarlaService(BaseSimServer):
 
     def _start_scenario_runner(self, sps: ScenarioPack, params: dict | None) -> None:
         if self._scenario_runner_path is None:
-            raise RuntimeError("scenario_runner_path is required when use_scenario_runner")
+            raise RuntimeError(
+                "scenario_runner_path is required when use_scenario_runner"
+            )
 
         sr_path = Path(self._scenario_runner_path)
         sr_script = sr_path / "scenario_runner.py" if sr_path.is_dir() else sr_path
@@ -348,7 +371,9 @@ class CarlaService(BaseSimServer):
                 config = config[0]
 
             case _:
-                raise RuntimeError(f"Unsupported scenario format: {self.scenario.format}")
+                raise RuntimeError(
+                    f"Unsupported scenario format: {self.scenario.format}"
+                )
 
         match self.scenario.format:
             case "open_scenario1":
@@ -363,7 +388,9 @@ class CarlaService(BaseSimServer):
                         actor_category=ego_config.category,
                     )
                     if actor is None:
-                        raise RuntimeError(f"Failed to spawn ego vehicle '{ego_config.rolename}'")
+                        raise RuntimeError(
+                            f"Failed to spawn ego vehicle '{ego_config.rolename}'"
+                        )
                     ego_vehicles.append(actor)
                 logger.debug(f"Spawned {len(ego_vehicles)} ego vehicles for scenario")
 
@@ -384,7 +411,9 @@ class CarlaService(BaseSimServer):
                 self._ego_vehicle = scenario.ego_vehicles[0]
 
             case _:
-                raise RuntimeError(f"Unsupported scenario format: {self.scenario.format}")
+                raise RuntimeError(
+                    f"Unsupported scenario format: {self.scenario.format}"
+                )
 
         self._sr_scenario = scenario
         self._sr_tree = scenario.scenario_tree
@@ -393,7 +422,11 @@ class CarlaService(BaseSimServer):
         self._sr_running = True
 
     def _stop_scenario_runner_module(self) -> None:
-        if self._sr_scenario is None and self._sr_tree is None and not self._sr_ego_vehicles:
+        if (
+            self._sr_scenario is None
+            and self._sr_tree is None
+            and not self._sr_ego_vehicles
+        ):
             logger.info("ScenarioRunner not running, no need to stop")
             return
 
@@ -642,7 +675,9 @@ class CarlaService(BaseSimServer):
             steer_speed = float(payload.get("steer_speed", 0.0))
 
             steer = float(payload.get("steer", 0.0)) * self._yaw_sign
-            speed = float(payload.get("speed", self._get_forward_speed(self._ego_vehicle)))
+            speed = float(
+                payload.get("speed", self._get_forward_speed(self._ego_vehicle))
+            )
             acceleration = payload.get("acceleration", None)
             if acceleration is None:
                 acceleration = float(self.config.get("ackermann_accel_default", 1.5))
