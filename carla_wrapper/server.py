@@ -46,7 +46,9 @@ class CarlaService(BaseSimServer):
         self._world = None
         self.config = None
         self._original_settings = None
-
+        self._output_base = None
+        self._output_dir = None
+        self._finalized = True
         self._objects_by_id = {}
         self._prev_yaw_rate = {}
 
@@ -67,6 +69,7 @@ class CarlaService(BaseSimServer):
         print("CARLA service initialized")
 
     def Init(self, request, context):
+        self._output_base = Path(request.output_dir.path)
         self.config = MessageToDict(request.config.config)
         self.scenario = request.scenario
         self._connect()
@@ -88,18 +91,27 @@ class CarlaService(BaseSimServer):
         self._spawned_actor_ids: set[int] = set()
         self._scenario_runner_path = self.config.get("scenario_runner_path", None)
         self._ego_role_name = self.config.get("ego_role_name", "hero")
-        self._scenario_runner_tm_port = int(self.config.get("scenario_runner_tm_port", 8000))
-        self._scenario_runner_tm_seed = int(self.config.get("scenario_runner_tm_seed", 0))
+        self._scenario_runner_tm_port = int(
+            self.config.get("scenario_runner_tm_port", 8000)
+        )
+        self._scenario_runner_tm_seed = int(
+            self.config.get("scenario_runner_tm_seed", 0)
+        )
 
         self._sr_scenario = None
         self._sr_tree = None
         self._sr_running = False
         self._sr_ego_vehicles: list = []
 
-        return sim_server_pb2.SimServerMessages.InitResponse(success=True, msg="CARLA initialized")
+        return sim_server_pb2.SimServerMessages.InitResponse(
+            success=True, msg="CARLA initialized"
+        )
 
     def Reset(self, request, context):
-        self._output_dir = request.output_dir
+        if not self._finalized:
+            self._finalize()
+
+        self._output_dir = self._output_base / Path(request.output_dir.path)
         self._time_ns = 0
         self._quit_flag = False
 
@@ -108,11 +120,11 @@ class CarlaService(BaseSimServer):
         # and `self._world.tick()` below crashes on the first Reset.
         self._ensure_world(request.scenario_pack)
         self._apply_world_settings()
-        self._destroy_spawned_actors()
-        self._stop_scenario_runner_module()
 
         logger.info("Starting ScenarioRunner...")
         self._start_scenario_runner(request.scenario_pack, request.params)
+
+        self._client.start_recorder(str(self._output_dir / "carla_recording.log"))
 
         if self._ego_vehicle is None:
             logger.warning("Ego vehicle not found after waiting, spawning ego...")
@@ -121,6 +133,8 @@ class CarlaService(BaseSimServer):
         if self._sync:
             self._world.tick()
         objects = self._collect_objects()
+
+        self._finalized = False
 
         return sim_server_pb2.SimServerMessages.ResetResponse(objects=objects)
 
@@ -142,6 +156,7 @@ class CarlaService(BaseSimServer):
         return sim_server_pb2.SimServerMessages.StepResponse(objects=objects)
 
     def Stop(self, request, context):
+        self._finalize()
         try:
             self._destroy_spawned_actors()
         finally:
@@ -163,7 +178,21 @@ class CarlaService(BaseSimServer):
         return Empty()
 
     def ShouldQuit(self, request, context):
-        return sim_server_pb2.SimServerMessages.ShouldQuitResponse(should_quit=self._quit_flag)
+        return sim_server_pb2.SimServerMessages.ShouldQuitResponse(
+            should_quit=self._quit_flag
+        )
+
+    def _finalize(self):
+        try:
+            if self._client is not None:
+                self._client.stop_recorder()
+            self._destroy_spawned_actors()
+            self._stop_scenario_runner_module()
+        except Exception:
+            logger.exception("Error during CARLA finalization")
+
+        self._finalized = True
+        logger.info("CARLA service finalized.")
 
     def _connect(self):
         if self._server_version is not None:
