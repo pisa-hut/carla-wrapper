@@ -13,15 +13,18 @@ RUN <<EOF
         build-essential g++-12 cmake ninja-build libvulkan1 \
         python3 python3-dev python3-pip python3-venv autoconf \
         wget curl rsync unzip git git-lfs libpng-dev libtiff5-dev \
-        libjpeg-dev
+        libjpeg-dev libgl-dev libglib2.0-dev
     rm -rf /var/lib/apt/lists/*
 EOF
+
 
 ADD https://security.ubuntu.com/ubuntu/pool/main/t/tiff/libtiff5_4.3.0-6_amd64.deb /tmp/libtiff5-dev.deb
 RUN dpkg -i /tmp/libtiff5-dev.deb && rm /tmp/libtiff5-dev.deb
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-ADD https://github.com/carla-simulator/scenario_runner.git /opt/scenario_runner
+# ADD https://github.com/carla-simulator/scenario_runner.git /opt/scenario_runner
+ADD https://github.com/derekwuchengyu/scenario_runner.git /opt/scenario_runner
+
 
 USER carla
 WORKDIR /app
