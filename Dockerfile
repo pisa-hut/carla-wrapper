@@ -24,7 +24,7 @@ RUN dpkg -i /tmp/libtiff5-dev.deb && rm /tmp/libtiff5-dev.deb
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 # ADD https://github.com/carla-simulator/scenario_runner.git /opt/scenario_runner
 ADD https://github.com/derekwuchengyu/scenario_runner.git /opt/scenario_runner
-
+RUN cp -r /opt/scenario_runner/srunner/examples/Catalogs /opt/Catalogs
 
 USER carla
 WORKDIR /app

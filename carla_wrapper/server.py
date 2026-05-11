@@ -194,8 +194,12 @@ class CarlaService(BaseSimServer):
             os.environ.get("CARLA_HOST", "localhost"),
             int(os.environ.get("CARLA_PORT", 2000)),
         )
-        self._client.set_timeout(float(os.environ.get("CARLA_TIMEOUT", 10.0)))
-        self._server_version = self._client.get_server_version()
+        try:
+            self._client.set_timeout(2.0)
+            self._server_version = self._client.get_server_version()
+        finally:
+            self._client.set_timeout(float(os.environ.get("CARLA_TIMEOUT", 10.0)))
+
         print("Connected to CARLA")
 
     def _to_carla_yaw(self, yaw_rad: float) -> float:
