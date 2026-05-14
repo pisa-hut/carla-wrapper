@@ -91,7 +91,8 @@ class CarlaService(BaseSimServer):
         self._spawned_actor_ids: set[int] = set()
         self._scenario_runner_path = self.config.get("scenario_runner_path", None)
         self._ego_role_name = self.config.get("ego_role_name", "hero")
-        self._scenario_runner_tm_port = int(self.config.get("scenario_runner_tm_port", 8000))
+
+        self._scenario_runner_tm_port = int(os.environ.get("CARLA_TM_PORT", 8000))
         self._scenario_runner_tm_seed = int(self.config.get("scenario_runner_tm_seed", 0))
 
         self._sr_scenario = None
@@ -109,9 +110,6 @@ class CarlaService(BaseSimServer):
         self._time_ns = 0
         self._quit_flag = False
 
-        # `_connect()` no longer populates `_world` (it only probes
-        # `get_server_version`), so without this call `_world` is None
-        # and `self._world.tick()` below crashes on the first Reset.
         self._ensure_world(request.scenario_pack)
         self._apply_world_settings()
 
