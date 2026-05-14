@@ -3,12 +3,17 @@ import math
 import os
 import subprocess
 import time
+import weakref
+from collections import deque
 from pathlib import Path
+from threading import Lock
 
 import carla
 import py_trees
 from google.protobuf.json_format import MessageToDict
+from google.protobuf.struct_pb2 import Struct
 from pisa_api import sim_server_pb2
+from pisa_api.collision_pb2 import CollisionInfo
 from pisa_api.control_pb2 import CtrlCmd, CtrlMode
 from pisa_api.empty_pb2 import Empty
 from pisa_api.object_pb2 import (
@@ -18,6 +23,7 @@ from pisa_api.object_pb2 import (
     Shape,
     ShapeType,
 )
+from pisa_api.runtime_frame_pb2 import RuntimeFrame
 from pisa_api.scenario_pb2 import ScenarioPack
 from pisa_api.wrapper import BaseSimServer, serve_sim, setup_logging
 from srunner.scenarioconfigs.openscenario_configuration import (
@@ -51,6 +57,10 @@ class CarlaService(BaseSimServer):
         self._finalized = True
         self._objects_by_id = {}
         self._prev_yaw_rate = {}
+        self._collision_sensor = None
+        self._collision_events = deque()
+        self._collision_lock = Lock()
+        self._last_object_index_by_actor_id: dict[int, int] = {}
 
         self._server_log_path = "/mnt/output/carla_server"
         os.makedirs(self._server_log_path, exist_ok=True)
@@ -115,6 +125,7 @@ class CarlaService(BaseSimServer):
         self._output_dir = self._output_base / Path(request.output_dir.path)
         self._time_ns = 0
         self._quit_flag = False
+        self._clear_collision_events()
 
         self._ensure_world(request.scenario_pack)
         self._apply_world_settings()
@@ -128,13 +139,14 @@ class CarlaService(BaseSimServer):
             logger.warning("Ego vehicle not found after waiting, spawning ego...")
             # self._spawn_ego(request.scenario_pack)
 
+        self._setup_collision_sensor()
         if self._sync:
             self._world.tick()
-        objects = self._collect_objects()
+        frame = self._collect_runtime_frame()
 
         self._finalized = False
 
-        return sim_server_pb2.SimServerMessages.ResetResponse(objects=objects)
+        return sim_server_pb2.SimServerMessages.ResetResponse(frame=frame)
 
     def Step(self, request, context):
         if self._world is None:
@@ -150,8 +162,8 @@ class CarlaService(BaseSimServer):
             self._world.tick()
         else:
             self._world.wait_for_tick()
-        objects = self._collect_objects()
-        return sim_server_pb2.SimServerMessages.StepResponse(objects=objects)
+        frame = self._collect_runtime_frame()
+        return sim_server_pb2.SimServerMessages.StepResponse(frame=frame)
 
     def Stop(self, request, context):
         self._finalize()
@@ -279,6 +291,7 @@ class CarlaService(BaseSimServer):
     def _destroy_spawned_actors(self) -> None:
         if self._world is None:
             return
+        self._destroy_collision_sensor()
         if not self._spawned_actor_ids:
             return
         for actor_id in list(self._spawned_actor_ids):
@@ -291,6 +304,8 @@ class CarlaService(BaseSimServer):
         self._spawned_actor_ids.clear()
         self._objects_by_id.clear()
         self._prev_yaw_rate.clear()
+        self._last_object_index_by_actor_id.clear()
+        self._clear_collision_events()
 
     def _spawn_ego(self, sps: ScenarioPack):
         # input("Press Enter to spawn ego vehicle...")
@@ -572,12 +587,41 @@ class CarlaService(BaseSimServer):
         fwd = actor.get_transform().get_forward_vector()
         return float(acc.x * fwd.x + acc.y * fwd.y + acc.z * fwd.z)
 
-    def _collect_objects(self) -> list[ObjectState]:
+    def _collect_runtime_frame(self) -> RuntimeFrame:
+        objects, sim_time_ns, carla_frame = self._collect_objects()
+        collisions = self._collect_collision_infos()
+
+        extras_payload = {
+            "carla_frame": carla_frame,
+            "object_index_by_actor_id": {
+                str(actor_id): index
+                for actor_id, index in self._last_object_index_by_actor_id.items()
+            },
+            "collision_count": len(collisions),
+            "untracked_collision_count": sum(
+                1 for collision in collisions if not collision.HasField("actor_b")
+            ),
+        }
+        if self._ego_vehicle is not None:
+            extras_payload["ego_actor_id"] = int(self._ego_vehicle.id)
+
+        extras = Struct()
+        extras.update(extras_payload)
+
+        return RuntimeFrame(
+            sim_time_ns=sim_time_ns,
+            objects=objects,
+            collision=collisions,
+            extras=extras,
+        )
+
+    def _collect_objects(self) -> tuple[list[ObjectState], int, int]:
         if self._world is None:
-            return []
+            return [], 0, 0
 
         snapshot = self._world.get_snapshot()
         sim_time_ns = int(snapshot.timestamp.elapsed_seconds * 1e9)
+        carla_frame = int(snapshot.frame)
 
         actors = []
         actors.extend(self._world.get_actors().filter("vehicle.*"))
@@ -639,11 +683,135 @@ class CarlaService(BaseSimServer):
                 continue
             objects.append(upsert(actor))
 
+        self._last_object_index_by_actor_id = {
+            actor.id: index for index, actor in enumerate(self._actors_for_objects(objects, actors))
+        }
         self._time_ns = sim_time_ns
 
         logger.debug(f"Collected {len(objects)} objects at time {sim_time_ns} ns")
 
-        return objects
+        return objects, sim_time_ns, carla_frame
+
+    def _actors_for_objects(self, objects: list[ObjectState], actors: list) -> list:
+        ordered_actors = []
+        if self._ego_vehicle is not None and objects:
+            ordered_actors.append(self._ego_vehicle)
+        for actor in actors:
+            if self._ego_vehicle is not None and actor.id == self._ego_vehicle.id:
+                continue
+            ordered_actors.append(actor)
+        return ordered_actors
+
+    def _setup_collision_sensor(self) -> None:
+        self._destroy_collision_sensor()
+        self._clear_collision_events()
+
+        if self._world is None or self._ego_vehicle is None:
+            return
+
+        try:
+            bp = self._world.get_blueprint_library().find("sensor.other.collision")
+            sensor = self._world.spawn_actor(bp, carla.Transform(), attach_to=self._ego_vehicle)
+            self._collision_sensor = sensor
+            self._spawned_actor_ids.add(sensor.id)
+
+            weak_self = weakref.ref(self)
+            sensor.listen(lambda event: CarlaService._on_collision_event(weak_self, event))
+        except Exception:
+            logger.exception("Failed to attach collision sensor to ego vehicle")
+            self._collision_sensor = None
+
+    def _destroy_collision_sensor(self) -> None:
+        sensor = self._collision_sensor
+        self._collision_sensor = None
+        if sensor is None:
+            return
+
+        try:
+            sensor.stop()
+        except Exception:
+            logger.exception("Failed to stop collision sensor")
+
+        try:
+            self._spawned_actor_ids.discard(sensor.id)
+            sensor.destroy()
+        except Exception:
+            logger.exception("Failed to destroy collision sensor")
+
+    def _clear_collision_events(self) -> None:
+        with self._collision_lock:
+            self._collision_events.clear()
+
+    @staticmethod
+    def _on_collision_event(weak_self, event) -> None:
+        self = weak_self()
+        if self is None:
+            return
+
+        impulse = getattr(event, "normal_impulse", None)
+        other_actor = getattr(event, "other_actor", None)
+        actor = getattr(event, "actor", None)
+
+        collision_event = {
+            "frame": int(getattr(event, "frame", 0)),
+            "timestamp": float(getattr(event, "timestamp", 0.0)),
+            "actor_id": int(actor.id) if actor is not None else None,
+            "other_actor_id": int(other_actor.id) if other_actor is not None else None,
+            "other_actor_type_id": getattr(other_actor, "type_id", ""),
+            "other_actor_semantic_tags": list(getattr(other_actor, "semantic_tags", [])),
+            "normal_impulse": {
+                "x": float(getattr(impulse, "x", 0.0)),
+                "y": float(getattr(impulse, "y", 0.0)),
+                "z": float(getattr(impulse, "z", 0.0)),
+            },
+        }
+        with self._collision_lock:
+            self._collision_events.append(collision_event)
+
+    def _collect_collision_infos(self) -> list[CollisionInfo]:
+        with self._collision_lock:
+            events = list(self._collision_events)
+            self._collision_events.clear()
+
+        collisions: list[CollisionInfo] = []
+        ego_actor_id = self._ego_vehicle.id if self._ego_vehicle is not None else None
+        for event in events:
+            actor_a_index = self._last_object_index_by_actor_id.get(event["actor_id"])
+            if actor_a_index is None and event["actor_id"] == ego_actor_id:
+                actor_a_index = 0
+            actor_b_index = self._last_object_index_by_actor_id.get(event["other_actor_id"])
+
+            impulse = event["normal_impulse"]
+            details_payload = {
+                "carla_frame": event["frame"],
+                "timestamp_seconds": event["timestamp"],
+                "other_actor_type_id": event["other_actor_type_id"],
+                "other_actor_semantic_tags": event["other_actor_semantic_tags"],
+                "normal_impulse": {
+                    "x": impulse["x"],
+                    "y": impulse["y"],
+                    "z": impulse["z"],
+                    "magnitude": math.sqrt(
+                        impulse["x"] ** 2 + impulse["y"] ** 2 + impulse["z"] ** 2
+                    ),
+                },
+            }
+            if event["actor_id"] is not None:
+                details_payload["actor_a_carla_id"] = event["actor_id"]
+            if event["other_actor_id"] is not None:
+                details_payload["actor_b_carla_id"] = event["other_actor_id"]
+
+            details = Struct()
+            details.update(details_payload)
+
+            collision = CollisionInfo(occurred=True, details=details)
+            if actor_a_index is not None:
+                collision.actor_a = actor_a_index
+            if actor_b_index is not None:
+                collision.actor_b = actor_b_index
+            collisions.append(collision)
+
+        return collisions
 
     def _apply_ctrl(self, ctrl: CtrlCmd, dt_s: float) -> None:
         if self._ego_vehicle is None:
