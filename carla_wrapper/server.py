@@ -91,7 +91,18 @@ class CarlaService(BaseSimServer):
         self._spawned_actor_ids: set[int] = set()
         self._scenario_runner_path = self.config.get("scenario_runner_path", None)
         self._ego_role_name = self.config.get("ego_role_name", "hero")
-        self._scenario_runner_tm_port = int(self.config.get("scenario_runner_tm_port", 8000))
+        # Prefer per-task CARLA_TM_PORT (set by the executor's
+        # service_manager) over the YAML default. Without this,
+        # concurrent CARLA tasks all bind TM on the same hardcoded
+        # port and the second one onward fails Reset with
+        # "trying to create rpc server for traffic manager;
+        # but the system failed to create because of bind error".
+        self._scenario_runner_tm_port = int(
+            os.environ.get(
+                "CARLA_TM_PORT",
+                self.config.get("scenario_runner_tm_port", 8000),
+            )
+        )
         self._scenario_runner_tm_seed = int(self.config.get("scenario_runner_tm_seed", 0))
 
         self._sr_scenario = None
