@@ -52,11 +52,17 @@ class CarlaService(BaseSimServer):
         self._objects_by_id = {}
         self._prev_yaw_rate = {}
 
-        subprocess.Popen(
-            ["/app/carla_server.sh"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        self._server_log_path = "/mnt/output/carla_server"
+        os.makedirs(self._server_log_path, exist_ok=True)
+        with (
+            open(f"{self._server_log_path}/stdout.log", "w") as out,
+            open(f"{self._server_log_path}/stderr.log", "w") as err,
+        ):
+            subprocess.Popen(
+                ["/app/carla_server.sh"],
+                stdout=out,
+                stderr=err,
+            )
 
         while self._server_version is None:
             try:
