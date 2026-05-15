@@ -1,5 +1,5 @@
 #!/bin/bash
 
 pushd /app
-uv run carla_wrapper/server.py
+uv run python -m carla_wrapper.server
 popd
