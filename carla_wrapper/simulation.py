@@ -8,29 +8,46 @@ from collections import deque
 from pathlib import Path
 from threading import Lock
 
-import carla
-import py_trees
-from google.protobuf.json_format import MessageToDict
-from google.protobuf.struct_pb2 import Struct
-from pisa_api.collision_pb2 import CollisionInfo
-from pisa_api.control_pb2 import CtrlCmd, CtrlMode
-from pisa_api.object_pb2 import (
-    ObjectKinematic,
-    ObjectState,
+from pisa_api.simulator import (
+    CollisionInfoData,
+    ControlCommand,
+    ControlMode,
+    InitRequest,
+    ObjectKinematicData,
+    ObjectStateData,
+    ResetRequest,
     RoadObjectType,
-    Shape,
+    RuntimeFrameData,
+    ScenarioPackData,
+    ShapeData,
+    ShapeDimensionData,
     ShapeType,
+    StepRequest,
 )
-from pisa_api.runtime_frame_pb2 import RuntimeFrame
-from pisa_api.scenario_pb2 import ScenarioPack
-from srunner.scenarioconfigs.openscenario_configuration import (
-    OpenScenarioConfiguration,
-)
-from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
-from srunner.scenariomanager.timer import GameTime
-from srunner.scenarios.open_scenario import OpenScenario
-from srunner.scenarios.route_scenario import RouteScenario
-from srunner.tools.route_parser import RouteParser
+
+try:
+    import carla
+    import py_trees
+    from srunner.scenarioconfigs.openscenario_configuration import (
+        OpenScenarioConfiguration,
+    )
+    from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
+    from srunner.scenariomanager.timer import GameTime
+    from srunner.scenarios.open_scenario import OpenScenario
+    from srunner.scenarios.route_scenario import RouteScenario
+    from srunner.tools.route_parser import RouteParser
+except ImportError as exc:
+    carla = None
+    py_trees = None
+    OpenScenarioConfiguration = None
+    CarlaDataProvider = None
+    GameTime = None
+    OpenScenario = None
+    RouteScenario = None
+    RouteParser = None
+    _CARLA_IMPORT_ERROR = exc
+else:
+    _CARLA_IMPORT_ERROR = None
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +56,13 @@ def _clamp(value: float, min_value: float, max_value: float) -> float:
     return max(min_value, min(max_value, value))
 
 
-class CarlaSimulation:
+class CarlaAdapter:
     def __init__(self):
+        if _CARLA_IMPORT_ERROR is not None:
+            raise RuntimeError(
+                "CARLA Python API and ScenarioRunner must be installed to run CarlaAdapter"
+            ) from _CARLA_IMPORT_ERROR
+
         self._client = None
         self._server_version = None
         self._world = None
@@ -55,6 +77,7 @@ class CarlaSimulation:
         self._collision_events = deque()
         self._collision_lock = Lock()
         self._last_object_index_by_actor_id: dict[int, int] = {}
+        self._quit_flag = False
 
         self._server_log_path = "/mnt/output/carla_server"
         os.makedirs(self._server_log_path, exist_ok=True)
@@ -78,13 +101,12 @@ class CarlaSimulation:
             break
         print("CARLA service initialized")
 
-    @property
     def should_quit(self) -> bool:
         return self._quit_flag
 
-    def initialize(self, request) -> None:
-        self._output_base = Path(request.output_dir.path)
-        self.config = MessageToDict(request.config.config)
+    def init(self, request: InitRequest) -> None:
+        self._output_base = request.output_dir
+        self.config = request.config
         self.scenario = request.scenario
         self._connect()
 
@@ -110,11 +132,11 @@ class CarlaSimulation:
         self._sr_running = False
         self._sr_ego_vehicles: list = []
 
-    def reset(self, request) -> RuntimeFrame:
+    def reset(self, request: ResetRequest) -> RuntimeFrameData:
         if not self._finalized:
             self._finalize()
 
-        self._output_dir = self._output_base / Path(request.output_dir.path)
+        self._output_dir = self._output_base / request.output_dir
         self._time_ns = 0
         self._quit_flag = False
         self._clear_collision_events()
@@ -139,9 +161,9 @@ class CarlaSimulation:
 
         return frame
 
-    def step(self, request) -> RuntimeFrame | None:
+    def step(self, request: StepRequest) -> RuntimeFrameData:
         if self._world is None:
-            return None
+            raise RuntimeError("CARLA world is not available")
 
         self._apply_ctrl(request.ctrl_cmd)
         self._tick_scenario_runner_module()
@@ -207,7 +229,7 @@ class CarlaSimulation:
     def _from_carla_yaw(self, yaw_deg: float) -> float:
         return math.radians((yaw_deg - self._yaw_offset_deg) * self._yaw_sign)
 
-    def _ensure_world(self, sps: ScenarioPack | None) -> None:
+    def _ensure_world(self, sps: ScenarioPackData | None) -> None:
         if self._client is None:
             self._connect()
 
@@ -284,13 +306,17 @@ class CarlaSimulation:
         self._last_object_index_by_actor_id.clear()
         self._clear_collision_events()
 
-    def _start_scenario_runner(self, sps: ScenarioPack, params: dict | None) -> None:
+    def _start_scenario_runner(self, sps: ScenarioPackData, params: dict | None) -> None:
         if self._scenario_runner_path is None:
             raise RuntimeError("scenario_runner_path is required when use_scenario_runner")
 
         self._start_scenario_runner_module(sps, params)
 
-    def _start_scenario_runner_module(self, sps: ScenarioPack, params: dict | None) -> None:
+    def _start_scenario_runner_module(
+        self,
+        sps: ScenarioPackData,
+        params: dict | None,
+    ) -> None:
         if self._client is None or self._world is None:
             raise RuntimeError("CARLA client/world not available")
 
@@ -318,7 +344,9 @@ class CarlaSimulation:
 
             case "carla_lb_route":
                 route_name = self.scenario.name
-                xml_path = os.path.join(self.scenario.path.path, f"{route_name}.xml")
+                if self.scenario.path is None:
+                    raise RuntimeError("Scenario path is required for carla_lb_route")
+                xml_path = str(self.scenario.path / f"{route_name}.xml")
                 config = RouteParser.parse_routes_file(xml_path, 0)
                 logger.info("Parsed route scenario config: %s", config)
                 config = config[0]
@@ -457,19 +485,19 @@ class CarlaSimulation:
             return RoadObjectType.CAR
         return RoadObjectType.UNKNOWN
 
-    def _shape_from_actor(self, actor) -> Shape:
+    def _shape_from_actor(self, actor) -> ShapeData:
         try:
             bb = actor.bounding_box
-            dims = Shape.Dimension(
+            dims = ShapeDimensionData(
                 x=float(bb.extent.x * 2.0),
                 y=float(bb.extent.y * 2.0),
                 z=float(bb.extent.z * 2.0),
             )
-            return Shape(type=ShapeType.BOUNDING_BOX, dimensions=dims)
+            return ShapeData(type=ShapeType.BOUNDING_BOX, dimensions=dims)
         except Exception:
-            return Shape(
+            return ShapeData(
                 type=ShapeType.BOUNDING_BOX,
-                dimensions=Shape.Dimension(x=0.0, y=0.0, z=0.0),
+                dimensions=ShapeDimensionData(x=0.0, y=0.0, z=0.0),
             )
 
     def _get_forward_speed(self, actor) -> float:
@@ -482,7 +510,7 @@ class CarlaSimulation:
         fwd = actor.get_transform().get_forward_vector()
         return float(acc.x * fwd.x + acc.y * fwd.y + acc.z * fwd.z)
 
-    def _collect_runtime_frame(self) -> RuntimeFrame:
+    def _collect_runtime_frame(self) -> RuntimeFrameData:
         objects, sim_time_ns, carla_frame = self._collect_objects()
         collisions = self._collect_collision_infos()
 
@@ -494,23 +522,20 @@ class CarlaSimulation:
             },
             "collision_count": len(collisions),
             "untracked_collision_count": sum(
-                1 for collision in collisions if not collision.HasField("actor_b")
+                1 for collision in collisions if collision.actor_b is None
             ),
         }
         if self._ego_vehicle is not None:
             extras_payload["ego_actor_id"] = int(self._ego_vehicle.id)
 
-        extras = Struct()
-        extras.update(extras_payload)
-
-        return RuntimeFrame(
+        return RuntimeFrameData(
             sim_time_ns=sim_time_ns,
             objects=objects,
             collision=collisions,
-            extras=extras,
+            extras=extras_payload,
         )
 
-    def _collect_objects(self) -> tuple[list[ObjectState], int, int]:
+    def _collect_objects(self) -> tuple[list[ObjectStateData], int, int]:
         if self._world is None:
             return [], 0, 0
 
@@ -528,7 +553,7 @@ class CarlaSimulation:
                 self._objects_by_id.pop(stale_id, None)
                 self._prev_yaw_rate.pop(stale_id, None)
 
-        objects: list[ObjectState] = []
+        objects: list[ObjectStateData] = []
         ordered_actors = []
 
         def upsert(actor):
@@ -547,7 +572,7 @@ class CarlaSimulation:
             yaw_acc = (yaw_rate - prev_rate) / dt_s if dt_s > 0 else 0.0
             self._prev_yaw_rate[actor.id] = yaw_rate
 
-            kin = ObjectKinematic(
+            kin = ObjectKinematicData(
                 time_ns=sim_time_ns,
                 x=float(transform.location.x),
                 y=float(transform.location.y) * self._yaw_sign,
@@ -560,14 +585,18 @@ class CarlaSimulation:
             )
             obj = self._objects_by_id.get(actor.id)
             if obj is None:
-                obj = ObjectState(
+                obj = ObjectStateData(
                     type=self._actor_type(actor),
                     kinematic=kin,
                     shape=self._shape_from_actor(actor),
                 )
-                self._objects_by_id[actor.id] = obj
             else:
-                obj.kinematic.CopyFrom(kin)
+                obj = ObjectStateData(
+                    type=obj.type,
+                    kinematic=kin,
+                    shape=obj.shape,
+                )
+            self._objects_by_id[actor.id] = obj
 
             return obj
 
@@ -604,7 +633,7 @@ class CarlaSimulation:
             self._spawned_actor_ids.add(sensor.id)
 
             weak_self = weakref.ref(self)
-            sensor.listen(lambda event: CarlaSimulation._on_collision_event(weak_self, event))
+            sensor.listen(lambda event: CarlaAdapter._on_collision_event(weak_self, event))
         except Exception:
             logger.exception("Failed to attach collision sensor to ego vehicle")
             self._collision_sensor = None
@@ -656,12 +685,12 @@ class CarlaSimulation:
         with self._collision_lock:
             self._collision_events.append(collision_event)
 
-    def _collect_collision_infos(self) -> list[CollisionInfo]:
+    def _collect_collision_infos(self) -> list[CollisionInfoData]:
         with self._collision_lock:
             events = list(self._collision_events)
             self._collision_events.clear()
 
-        collisions: list[CollisionInfo] = []
+        collisions: list[CollisionInfoData] = []
         ego_actor_id = self._ego_vehicle.id if self._ego_vehicle is not None else None
         for event in events:
             actor_a_index = self._last_object_index_by_actor_id.get(event["actor_id"])
@@ -689,27 +718,26 @@ class CarlaSimulation:
             if event["other_actor_id"] is not None:
                 details_payload["actor_b_carla_id"] = event["other_actor_id"]
 
-            details = Struct()
-            details.update(details_payload)
-
-            collision = CollisionInfo(occurred=True, details=details)
-            if actor_a_index is not None:
-                collision.actor_a = actor_a_index
-            if actor_b_index is not None:
-                collision.actor_b = actor_b_index
-            collisions.append(collision)
+            collisions.append(
+                CollisionInfoData(
+                    occurred=True,
+                    actor_a=actor_a_index,
+                    actor_b=actor_b_index,
+                    details=details_payload,
+                )
+            )
 
         return collisions
 
-    def _apply_ctrl(self, ctrl: CtrlCmd) -> None:
+    def _apply_ctrl(self, ctrl: ControlCommand | None) -> None:
         if self._ego_vehicle is None:
             return
-        if ctrl is None or ctrl.mode == CtrlMode.NONE:
+        if ctrl is None or ctrl.mode == ControlMode.NONE:
             return
 
-        payload = MessageToDict(ctrl.payload)
+        payload = ctrl.payload
 
-        if ctrl.mode == CtrlMode.THROTTLE_STEER:
+        if ctrl.mode == ControlMode.THROTTLE_STEER:
             if "throttle" in payload or "brake" in payload:
                 throttle = float(payload.get("throttle", 0.0))
                 brake = float(payload.get("brake", 0.0))
@@ -734,7 +762,7 @@ class CarlaSimulation:
             self._ego_vehicle.apply_control(control)
             return
 
-        elif ctrl.mode == CtrlMode.ACKERMANN:
+        elif ctrl.mode == ControlMode.ACKERMANN:
             steer_speed = float(payload.get("steer_speed", 0.0))
 
             steer = float(payload.get("steer", 0.0)) * self._yaw_sign
@@ -765,7 +793,7 @@ class CarlaSimulation:
             self._ego_vehicle.apply_ackermann_control(control)
             return
 
-        elif ctrl.mode == CtrlMode.POSITION:
+        elif ctrl.mode == ControlMode.POSITION:
             transform = self._ego_vehicle.get_transform()
             x = float(payload.get("x", transform.location.x))
             y = float(payload.get("y", transform.location.y))
@@ -783,3 +811,6 @@ class CarlaSimulation:
             return
 
         logger.warning("Unsupported control mode: %s", ctrl.mode)
+
+
+CarlaSimulation = CarlaAdapter
