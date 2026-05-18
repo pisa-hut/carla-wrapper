@@ -737,7 +737,18 @@ class CarlaAdapter:
 
         payload = ctrl.payload
 
-        if ctrl.mode == ControlMode.THROTTLE_STEER:
+        if ctrl.mode == ControlMode.THROTTLE_STEER_BREAK:
+            throttle = _clamp(float(payload.get("throttle", 0.0)), 0.0, 1.0)
+            brake = _clamp(float(payload.get("brake", 0.0)), 0.0, 1.0)
+            steer = _clamp(float(payload.get("steer", 0.0)), -1.0, 1.0)
+
+            control = carla.VehicleControl(
+                throttle=throttle, steer=steer * self._yaw_sign, brake=brake
+            )
+            self._ego_vehicle.apply_control(control)
+            return
+
+        elif ctrl.mode == ControlMode.THROTTLE_STEER:
             if "throttle" in payload or "brake" in payload:
                 throttle = float(payload.get("throttle", 0.0))
                 brake = float(payload.get("brake", 0.0))
@@ -766,7 +777,11 @@ class CarlaAdapter:
             steer_speed = float(payload.get("steer_speed", 0.0))
 
             steer = float(payload.get("steer", 0.0)) * self._yaw_sign
-            speed = float(payload.get("speed", self._get_forward_speed(self._ego_vehicle)))
+            speed = (
+                float(payload["speed"])
+                if "speed" in payload
+                else self._get_forward_speed(self._ego_vehicle)
+            )
             acceleration = payload.get("acceleration", None)
             if acceleration is None:
                 acceleration = float(self.config.get("ackermann_accel_default", 1.5))
@@ -779,9 +794,7 @@ class CarlaAdapter:
                 jerk = float(jerk)
 
             if self._max_steer_rad:
-                steer = _clamp(steer / self._max_steer_rad, -1.0, 1.0)
-            else:
-                steer = _clamp(steer, -1.0, 1.0)
+                steer = _clamp(steer, -self._max_steer_rad, self._max_steer_rad)
 
             control = carla.VehicleAckermannControl(
                 steer=steer,
@@ -796,7 +809,11 @@ class CarlaAdapter:
         elif ctrl.mode == ControlMode.POSITION:
             transform = self._ego_vehicle.get_transform()
             x = float(payload.get("x", transform.location.x))
-            y = float(payload.get("y", transform.location.y))
+            y = (
+                float(payload["y"]) * self._yaw_sign
+                if "y" in payload
+                else transform.location.y
+            )
             z = float(payload.get("z", transform.location.z))
             h = float(payload.get("h", self._from_carla_yaw(transform.rotation.yaw)))
             yaw_deg = self._to_carla_yaw(h)
