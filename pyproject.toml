@@ -24,13 +24,10 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = [
-    "pytest>=8.0",
-    "ruff>=0.6",
-]
+dev = ["pytest>=8.0", "ruff>=0.6"]
 
 [tool.uv.sources]
-pisa-api = { git = "https://github.com/pisa-hut/pisa-api.git", branch = "feat/server-wrapping" }
+pisa-api = { git = "https://github.com/pisa-hut/pisa-api.git" }
 
 [tool.ruff]
 line-length = 100
