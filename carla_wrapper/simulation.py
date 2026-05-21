@@ -13,6 +13,7 @@ from pisa_api.simulator import (
     ControlCommand,
     ControlMode,
     InitRequest,
+    InitResponse,
     ObjectKinematicData,
     ObjectStateData,
     ResetRequest,
@@ -77,6 +78,11 @@ class CarlaAdapter:
         self._collision_events = deque()
         self._collision_lock = Lock()
         self._last_object_index_by_actor_id: dict[int, int] = {}
+        self._last_applied_control: dict | None = None
+        self._external_control_prepared_actor_id: int | None = None
+        self._disable_sr_ego_control = True
+        self._sr_ego_control_ticks = 0
+        self._sr_ego_control_ticks_before_disable = 1
         self._quit_flag = False
 
         self._server_log_path = "/mnt/output/carla_server"
@@ -90,25 +96,18 @@ class CarlaAdapter:
                 stdout=out,
                 stderr=err,
             )
-
-        while self._server_version is None:
-            try:
-                self._connect()
-            except Exception:
-                logger.exception("Failed to connect to CARLA, retrying in 2 seconds...")
-                time.sleep(2)
-                continue
-            break
-        print("CARLA service initialized")
+        logger.info("CARLA service launched.")
 
     def should_quit(self) -> bool:
         return self._quit_flag
 
-    def init(self, request: InitRequest) -> None:
+    def init(self, request: InitRequest) -> InitResponse:
         self._output_base = request.output_dir
         self.config = request.config
         self.scenario = request.scenario
-        self._connect()
+
+        if not self._ensure_connected():
+            return InitResponse(success=False, msg="Failed to connect to CARLA within timeout")
 
         self._fixed_delta_seconds = request.dt
 
@@ -118,11 +117,19 @@ class CarlaAdapter:
         self._yaw_offset_deg = float(self.config.get("yaw_offset_deg", 0.0))
 
         self._max_steer_rad: float | None = None
+        self._last_applied_control = None
+        self._external_control_prepared_actor_id = None
         self._quit_flag = False
 
         self._spawned_actor_ids: set[int] = set()
         self._scenario_runner_path = self.config.get("scenario_runner_path", None)
-        self._ego_role_name = self.config.get("ego_role_name", "hero")
+        self._disable_sr_ego_control = bool(
+            self.config.get("disable_scenario_runner_ego_control", True)
+        )
+        self._sr_ego_control_ticks = 0
+        self._sr_ego_control_ticks_before_disable = int(
+            self.config.get("scenario_runner_ego_control_ticks_before_disable", 1)
+        )
 
         self._scenario_runner_tm_port = int(os.environ.get("CARLA_TM_PORT", 8000))
         self._scenario_runner_tm_seed = int(self.config.get("scenario_runner_tm_seed", 0))
@@ -131,6 +138,8 @@ class CarlaAdapter:
         self._sr_tree = None
         self._sr_running = False
         self._sr_ego_vehicles: list = []
+
+        return InitResponse(success=True)
 
     def reset(self, request: ResetRequest) -> RuntimeFrameData:
         if not self._finalized:
@@ -153,8 +162,10 @@ class CarlaAdapter:
             logger.warning("Ego vehicle not found after starting ScenarioRunner")
 
         self._setup_collision_sensor()
+        self._tick_scenario_runner_module()
         if self._sync:
             self._world.tick()
+
         frame = self._collect_runtime_frame()
 
         self._finalized = False
@@ -165,8 +176,8 @@ class CarlaAdapter:
         if self._world is None:
             raise RuntimeError("CARLA world is not available")
 
-        self._apply_ctrl(request.ctrl_cmd)
         self._tick_scenario_runner_module()
+        self._apply_ctrl(request.ctrl_cmd)
         if self._sync:
             self._world.tick()
         else:
@@ -189,9 +200,6 @@ class CarlaAdapter:
         self._ego_vehicle = None
         self._world = None
         self._client = None
-        # Clear `_server_version` too — it's the reconnection guard in
-        # `_connect()`, so a follow-up `Init` after this Stop would
-        # short-circuit the connect and leave `_client` as None.
         self._server_version = None
         logger.info("CARLA simulator stopped.")
 
@@ -207,21 +215,21 @@ class CarlaAdapter:
         self._finalized = True
         logger.info("CARLA service finalized.")
 
-    def _connect(self):
+    def _connect(self, timeout: float):
         if self._server_version is not None:
             return
-        print("Connecting to CARLA...")
+        logger.info("Connecting to CARLA...")
         self._client = carla.Client(
             os.environ.get("CARLA_HOST", "localhost"),
             int(os.environ.get("CARLA_PORT", 2000)),
         )
         try:
-            self._client.set_timeout(2.0)
+            self._client.set_timeout(timeout)
             self._server_version = self._client.get_server_version()
         finally:
             self._client.set_timeout(float(os.environ.get("CARLA_TIMEOUT", 10.0)))
 
-        print("Connected to CARLA")
+        logger.info("Connected to CARLA")
 
     def _to_carla_yaw(self, yaw_rad: float) -> float:
         return self._yaw_sign * math.degrees(yaw_rad) + self._yaw_offset_deg
@@ -229,9 +237,72 @@ class CarlaAdapter:
     def _from_carla_yaw(self, yaw_deg: float) -> float:
         return math.radians((yaw_deg - self._yaw_offset_deg) * self._yaw_sign)
 
+    def _prepare_ego_for_external_control(self) -> None:
+        if self._ego_vehicle is None:
+            return
+        actor_id = int(self._ego_vehicle.id) if hasattr(self._ego_vehicle, "id") else None
+        if actor_id is not None and actor_id == self._external_control_prepared_actor_id:
+            return
+        if hasattr(self._ego_vehicle, "set_autopilot"):
+            try:
+                self._ego_vehicle.set_autopilot(False, self._scenario_runner_tm_port)
+            except TypeError:
+                self._ego_vehicle.set_autopilot(False)
+            except Exception:
+                logger.exception("Failed to disable ego vehicle autopilot")
+        if hasattr(self._ego_vehicle, "set_simulate_physics"):
+            try:
+                self._ego_vehicle.set_simulate_physics(True)
+            except Exception:
+                logger.exception("Failed to enable ego vehicle physics")
+        
+        self._external_control_prepared_actor_id = actor_id
+
+    def _clear_ego_vehicle_control(self, reason: str) -> None:
+        if self._ego_vehicle is None or carla is None:
+            return
+        if not hasattr(self._ego_vehicle, "apply_control"):
+            return
+        if not hasattr(carla, "VehicleControl"):
+            return
+
+        control = carla.VehicleControl(throttle=0.0, steer=0.0, brake=0.0)
+        try:
+            self._ego_vehicle.apply_control(control)
+        except Exception:
+            logger.exception("Failed to clear ego vehicle control after %s", reason)
+            return
+
+        self._last_applied_control = {
+            "mode": "CLEAR_EGO_CONTROL",
+            "reason": reason,
+            "throttle": 0.0,
+            "brake": 0.0,
+            "steer": 0.0,
+        }
+
+
+
+    def _ensure_connected(self) -> bool:
+        t = self.config.get("carla_connect_timeout_seconds", 10)
+        retry_interval = self.config.get("retry_interval_seconds", 2)
+        while t > 0 and self._server_version is None:
+            try:
+                self._connect(2)
+            except Exception:
+                logger.error(f"Failed to connect to CARLA, retrying in {retry_interval} seconds...")
+                time.sleep(retry_interval)
+                t -= retry_interval
+                if t <= 0:
+                    return False
+                continue
+            
+            return True
+
+
     def _ensure_world(self, sps: ScenarioPackData | None) -> None:
-        if self._client is None:
-            self._connect()
+        if self._server_version is None:
+            self._ensure_connected()
 
         opendrive_name = sps.map_name
         opendrive_path = Path(f"/mnt/map/xodr/{opendrive_name}.xodr").resolve()
@@ -458,12 +529,40 @@ class CarlaAdapter:
         if self._sr_tree is None or not self._sr_running:
             return
 
+        if self._sr_ego_control_ticks_before_disable <= 0:
+            self._disable_scenario_runner_ego_control()
         GameTime.on_carla_tick(timestamp)
         CarlaDataProvider.on_carla_tick()
         self._sr_tree.tick_once()
+        self._sr_ego_control_ticks += 1
+        if self._sr_ego_control_ticks >= self._sr_ego_control_ticks_before_disable:
+            self._disable_scenario_runner_ego_control()
         if self._sr_tree.status != py_trees.common.Status.RUNNING:
             self._sr_running = False
             self._quit_flag = True
+
+    def _disable_scenario_runner_ego_control(self) -> None:
+        if not self._disable_sr_ego_control:
+            return
+        if self._ego_vehicle is None or py_trees is None:
+            return
+
+        try:
+            actor_dict = py_trees.blackboard.Blackboard().ActorsWithController
+        except AttributeError:
+            return
+
+        ego_actor_id = getattr(self._ego_vehicle, "id", None)
+        if ego_actor_id is None or ego_actor_id not in actor_dict:
+            return
+
+        controller = actor_dict.pop(ego_actor_id)
+        try:
+            controller.reset()
+        except Exception:
+            logger.exception("Failed to reset ScenarioRunner ego controller")
+        py_trees.blackboard.Blackboard().set("ActorsWithController", actor_dict, overwrite=True)
+        self._clear_ego_vehicle_control("scenario_runner_ego_control_disabled")
 
     def _actor_type(self, actor) -> RoadObjectType:
         type_id = actor.type_id.lower()
@@ -510,6 +609,25 @@ class CarlaAdapter:
         fwd = actor.get_transform().get_forward_vector()
         return float(acc.x * fwd.x + acc.y * fwd.y + acc.z * fwd.z)
 
+    def _ackermann_steer_to_vehicle_control(self, steer_rad: float) -> float:
+        if self._max_steer_rad:
+            return _clamp(steer_rad / self._max_steer_rad, -1.0, 1.0)
+        return _clamp(steer_rad, -1.0, 1.0)
+
+    def _ackermann_speed_to_vehicle_control(self, target_speed: float) -> tuple[float, float]:
+        current_speed = self._get_forward_speed(self._ego_vehicle)
+        speed_error = target_speed - current_speed
+        if target_speed <= 0.0 and current_speed > 0.05:
+            return 0.0, 1.0
+
+        kp = float(self.config.get("ackermann_speed_kp", 0.35))
+        if speed_error >= 0.0:
+            throttle = _clamp(speed_error * kp, 0.0, 1.0)
+            if target_speed > 0.05 and throttle > 0.0:
+                throttle = max(throttle, float(self.config.get("ackermann_min_throttle", 0.2)))
+            return throttle, 0.0
+        return 0.0, _clamp(-speed_error * kp, 0.0, 1.0)
+
     def _collect_runtime_frame(self) -> RuntimeFrameData:
         objects, sim_time_ns, carla_frame = self._collect_objects()
         collisions = self._collect_collision_infos()
@@ -527,6 +645,8 @@ class CarlaAdapter:
         }
         if self._ego_vehicle is not None:
             extras_payload["ego_actor_id"] = int(self._ego_vehicle.id)
+        if self._last_applied_control is not None:
+            extras_payload["last_applied_control"] = dict(self._last_applied_control)
 
         return RuntimeFrameData(
             sim_time_ns=sim_time_ns,
@@ -735,17 +855,26 @@ class CarlaAdapter:
         if ctrl is None or ctrl.mode == ControlMode.NONE:
             return
 
+        self._prepare_ego_for_external_control()
         payload = ctrl.payload
 
         if ctrl.mode == ControlMode.THROTTLE_STEER_BREAK:
             throttle = _clamp(float(payload.get("throttle", 0.0)), 0.0, 1.0)
             brake = _clamp(float(payload.get("brake", 0.0)), 0.0, 1.0)
             steer = _clamp(float(payload.get("steer", 0.0)), -1.0, 1.0)
+            if brake > 0.0:
+                throttle = 0.0
 
             control = carla.VehicleControl(
                 throttle=throttle, steer=steer * self._yaw_sign, brake=brake
             )
             self._ego_vehicle.apply_control(control)
+            self._last_applied_control = {
+                "mode": ctrl.mode.name,
+                "throttle": throttle,
+                "brake": brake,
+                "steer": steer * self._yaw_sign,
+            }
             return
 
         elif ctrl.mode == ControlMode.THROTTLE_STEER:
@@ -767,10 +896,18 @@ class CarlaAdapter:
                     brake = _clamp(abs(pedal), 0.0, 1.0)
                 steer = _clamp(wheel, -1.0, 1.0)
 
+            if brake > 0.0:
+                throttle = 0.0
             control = carla.VehicleControl(
                 throttle=throttle, steer=steer * self._yaw_sign, brake=brake
             )
             self._ego_vehicle.apply_control(control)
+            self._last_applied_control = {
+                "mode": ctrl.mode.name,
+                "throttle": throttle,
+                "brake": brake,
+                "steer": steer * self._yaw_sign,
+            }
             return
 
         elif ctrl.mode == ControlMode.ACKERMANN:
@@ -795,15 +932,50 @@ class CarlaAdapter:
 
             if self._max_steer_rad:
                 steer = _clamp(steer, -self._max_steer_rad, self._max_steer_rad)
+            if bool(self.config.get("ackermann_use_native_control", False)):
+                control = carla.VehicleAckermannControl(
+                    steer=steer,
+                    steer_speed=steer_speed,
+                    speed=speed,
+                    acceleration=acceleration,
+                    jerk=jerk,
+                )
+                
+                self._ego_vehicle.apply_ackermann_control(control)
+                applied_payload = {
+                    "mode": ctrl.mode.name,
+                    "backend": "native_ackermann",
+                    "steer": steer,
+                    "steer_speed": steer_speed,
+                    "speed": speed,
+                    "acceleration": acceleration,
+                    "jerk": jerk,
+                }
+            else:
+                throttle, brake = self._ackermann_speed_to_vehicle_control(max(speed, 0.0))
+                vehicle_steer = self._ackermann_steer_to_vehicle_control(steer)
+                control = carla.VehicleControl(
+                    throttle=throttle,
+                    steer=vehicle_steer,
+                    brake=brake,
+                )
+                self._ego_vehicle.apply_control(control)
+                applied_payload = {
+                    "mode": ctrl.mode.name,
+                    "backend": "vehicle_control",
+                    "throttle": throttle,
+                    "brake": brake,
+                    "steer": vehicle_steer,
+                    "target_speed": max(speed, 0.0),
+                    "acceleration": acceleration,
+                    "jerk": jerk,
+                }
 
-            control = carla.VehicleAckermannControl(
-                steer=steer,
-                steer_speed=steer_speed,
-                speed=speed,
-                acceleration=acceleration,
-                jerk=jerk,
-            )
-            self._ego_vehicle.apply_ackermann_control(control)
+            self._last_applied_control = {
+                **applied_payload,
+                "ackermann_steer": steer,
+                "ackermann_steer_speed": steer_speed,
+            }
             return
 
         elif ctrl.mode == ControlMode.POSITION:
