@@ -127,7 +127,6 @@ def test_finalize_destroys_collision_sensor_before_scenario_runner_cleanup() -> 
     adapter = CarlaAdapter.__new__(CarlaAdapter)
     adapter._client = SimpleNamespace(stop_recorder=lambda: calls.append("stop_recorder"))
     adapter._destroy_spawned_actors = lambda: calls.append("destroy_spawned_actors")
-    adapter._restore_world_settings = lambda: calls.append("restore_world_settings")
     adapter._stop_scenario_runner_module = lambda: calls.append("stop_scenario_runner")
 
     adapter._finalize()
@@ -135,7 +134,6 @@ def test_finalize_destroys_collision_sensor_before_scenario_runner_cleanup() -> 
     assert calls == [
         "stop_recorder",
         "destroy_spawned_actors",
-        "restore_world_settings",
         "stop_scenario_runner",
     ]
     assert adapter._finalized is True
@@ -150,17 +148,63 @@ def test_finalize_continues_after_recorder_stop_failure() -> None:
         stop_recorder=lambda: (_ for _ in ()).throw(RuntimeError("recorder failed"))
     )
     adapter._destroy_spawned_actors = lambda: calls.append("destroy_spawned_actors")
-    adapter._restore_world_settings = lambda: calls.append("restore_world_settings")
     adapter._stop_scenario_runner_module = lambda: calls.append("stop_scenario_runner")
 
     adapter._finalize()
 
     assert calls == [
         "destroy_spawned_actors",
-        "restore_world_settings",
         "stop_scenario_runner",
     ]
     assert adapter._finalized is True
+
+
+def test_init_finalizes_previous_run_and_prepares_reused_server() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    calls = []
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._finalized = False
+    adapter._finalize = lambda: calls.append("finalize")
+    adapter._ensure_connected = lambda: True
+    adapter._prepare_reused_server_state = lambda: calls.append("prepare_reused_server")
+
+    request = SimpleNamespace(
+        output_dir="out",
+        config={},
+        scenario=SimpleNamespace(format="open_scenario1"),
+        dt=0.05,
+    )
+
+    adapter.init(request)
+
+    assert calls == ["finalize", "prepare_reused_server"]
+
+
+def test_prepare_reused_server_forces_async_and_clears_dynamic_actors() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    vehicle = _FakeActor(actor_id=1, type_id="vehicle.tesla.model3")
+    traffic_light = _FakeActor(actor_id=2, type_id="traffic.traffic_light")
+    world = _FakeSettingsWorld(
+        [vehicle, traffic_light],
+        synchronous_mode=True,
+        fixed_delta_seconds=0.05,
+    )
+    traffic_manager = _FakeTrafficManager()
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._client = _FakeClient(world, traffic_manager=traffic_manager)
+    adapter._scenario_runner_tm_port = 8000
+
+    adapter._prepare_reused_server_state()
+
+    assert adapter._world is world
+    assert world.settings.synchronous_mode is False
+    assert world.settings.fixed_delta_seconds is None
+    assert world.applied_settings is world.settings
+    assert traffic_manager.sync_calls == [False]
+    assert vehicle.destroy_calls == 1
+    assert traffic_light.destroy_calls == 0
 
 
 def test_reset_finalizes_partial_state_on_failure(tmp_path) -> None:
@@ -170,8 +214,12 @@ def test_reset_finalizes_partial_state_on_failure(tmp_path) -> None:
     adapter = CarlaAdapter.__new__(CarlaAdapter)
     adapter._finalized = True
     adapter._output_base = tmp_path
+    adapter.scenario = SimpleNamespace(format="carla_lb_route")
     adapter._clear_collision_events = lambda: calls.append("clear_collision_events")
-    adapter._ensure_world = lambda scenario_pack: calls.append(("ensure_world", scenario_pack))
+    adapter._ensure_world = lambda scenario_pack, generate_opendrive_world=True: calls.append(
+        ("ensure_world", scenario_pack, generate_opendrive_world)
+    )
+    adapter._clear_dynamic_actors = lambda: calls.append("clear_dynamic_actors")
     adapter._apply_world_settings = lambda: calls.append("apply_world_settings")
     adapter._client = SimpleNamespace(start_recorder=lambda path: calls.append(("recorder", path)))
     adapter._start_scenario_runner = lambda scenario_pack, params: (_ for _ in ()).throw(
@@ -185,6 +233,54 @@ def test_reset_finalizes_partial_state_on_failure(tmp_path) -> None:
         adapter.reset(request)
 
     assert calls[-1] == "finalize"
+    assert calls[1][0] == "ensure_world"
+
+
+def test_open_scenario_reset_delegates_world_loading_to_scenario_runner(tmp_path) -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    calls = []
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._finalized = True
+    adapter._output_base = tmp_path
+    adapter.scenario = SimpleNamespace(format="open_scenario1")
+    adapter._sync = False
+    adapter._ego_vehicle = object()
+    adapter._clear_collision_events = lambda: calls.append("clear_collision_events")
+    adapter._ensure_world = lambda scenario_pack, generate_opendrive_world=True: calls.append(
+        ("ensure_world", generate_opendrive_world)
+    )
+    adapter._clear_dynamic_actors = lambda: calls.append("clear_dynamic_actors")
+    adapter._apply_world_settings = lambda: calls.append("apply_world_settings")
+    adapter._client = SimpleNamespace(start_recorder=lambda path: calls.append("start_recorder"))
+    adapter._start_scenario_runner = lambda scenario_pack, params: calls.append(
+        "start_scenario_runner"
+    )
+    adapter._setup_collision_sensor = lambda: calls.append("setup_collision_sensor")
+    adapter._tick_scenario_runner_module = lambda: calls.append("tick_scenario_runner")
+    adapter._collect_runtime_frame = lambda: RuntimeFrameData()
+    adapter._finalize = lambda: calls.append("finalize")
+
+    request = SimpleNamespace(output_dir="run", scenario_pack=object(), params={})
+
+    adapter.reset(request)
+
+    assert ("ensure_world", False) in calls
+    assert "apply_world_settings" not in calls
+
+
+def test_ensure_world_can_skip_opendrive_generation() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    world = _FakeSettingsWorld()
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._server_version = "test"
+    adapter._client = _FakeClient(world)
+
+    adapter._ensure_world(SimpleNamespace(), generate_opendrive_world=False)
+
+    assert adapter._world is world
+    assert adapter._client.generated is False
 
 
 def test_ensure_world_requires_scenario_pack() -> None:
@@ -234,6 +330,147 @@ def test_open_scenario_missing_xosc_fails_before_scenario_runner(monkeypatch) ->
 
     with pytest.raises(RuntimeError, match="OpenSCENARIO file not found"):
         adapter._start_scenario_runner_module(SimpleNamespace(name="missing"), {})
+
+
+def test_open_scenario_uses_scenario_runner_reloaded_world(monkeypatch) -> None:
+    from carla_wrapper import simulation
+
+    old_world = _FakeSettingsWorld()
+    new_world = _FakeSettingsWorld()
+    actor = _FakeVehicle()
+    calls = []
+
+    class FakeDataProvider:
+        current_world = old_world
+
+        @staticmethod
+        def set_client(client):
+            calls.append("set_client")
+
+        @staticmethod
+        def set_world(world):
+            FakeDataProvider.current_world = world
+            calls.append(("set_world", world, world.applied_settings is not None))
+
+        @staticmethod
+        def get_world():
+            return FakeDataProvider.current_world
+
+        @staticmethod
+        def set_traffic_manager_port(port):
+            calls.append(("tm_port", port))
+
+        @staticmethod
+        def request_new_actor(*args, **kwargs):
+            calls.append(("request_new_actor", FakeDataProvider.current_world))
+            return actor
+
+    class FakeOpenScenarioConfiguration:
+        def __init__(self, filename, client, params):
+            calls.append("config")
+            FakeDataProvider.current_world = new_world
+            self.ego_vehicles = [
+                SimpleNamespace(
+                    model="vehicle.lincoln.mkz_2017",
+                    transform=object(),
+                    rolename="hero",
+                    random_location=False,
+                    color=None,
+                    category="car",
+                )
+            ]
+            self.name = "scenario"
+
+    class FakeOpenScenario:
+        def __init__(self, world, ego_vehicles, config, config_file, timeout):
+            calls.append(("open_scenario", world, new_world.applied_settings is not None))
+            self.scenario_tree = object()
+
+    monkeypatch.setattr(simulation, "CarlaDataProvider", FakeDataProvider)
+    monkeypatch.setattr(simulation, "OpenScenarioConfiguration", FakeOpenScenarioConfiguration)
+    monkeypatch.setattr(simulation, "OpenScenario", FakeOpenScenario)
+    monkeypatch.setattr(
+        simulation, "GameTime", SimpleNamespace(restart=lambda: calls.append("restart"))
+    )
+    monkeypatch.setattr(simulation.Path, "exists", lambda self: True)
+
+    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
+    adapter._client = SimpleNamespace(get_trafficmanager=lambda port: _FakeTrafficManager())
+    adapter._world = old_world
+    adapter._scenario_runner_tm_port = 8000
+    adapter._scenario_runner_tm_seed = 0
+    adapter._sync = True
+    adapter._fixed_delta_seconds = 0.05
+    adapter._no_rendering = False
+    adapter._traffic_manager = None
+    adapter._traffic_manager_sync_enabled = False
+    adapter._sr_ego_vehicles = []
+    adapter.scenario = SimpleNamespace(format="open_scenario1")
+
+    adapter._start_scenario_runner_module(SimpleNamespace(name="scenario", timeout_ns=0), {})
+
+    assert adapter._world is new_world
+    assert adapter._ego_vehicle is actor
+    assert ("request_new_actor", new_world) in calls
+    assert ("open_scenario", new_world, True) in calls
+    set_world_calls = [call for call in calls if call[0] == "set_world"]
+    assert set_world_calls[-1] == ("set_world", new_world, True)
+
+
+def test_clear_dynamic_actors_only_destroys_runtime_actor_types() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    vehicle = _FakeActor(actor_id=1, type_id="vehicle.tesla.model3")
+    walker = _FakeActor(actor_id=2, type_id="walker.pedestrian.0001")
+    walker_controller = _FakeActor(actor_id=3, type_id="controller.ai.walker")
+    sensor = _FakeActor(actor_id=4, type_id="sensor.other.collision")
+    traffic_light = _FakeActor(actor_id=5, type_id="traffic.traffic_light")
+    prop = _FakeActor(actor_id=6, type_id="static.prop.streetbarrier")
+    world = _FakeSettingsWorld([vehicle, walker, walker_controller, sensor, traffic_light, prop])
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._world = world
+
+    adapter._clear_dynamic_actors()
+
+    assert vehicle.destroy_calls == 1
+    assert walker.destroy_calls == 1
+    assert walker_controller.destroy_calls == 1
+    assert sensor.destroy_calls == 1
+    assert traffic_light.destroy_calls == 0
+    assert prop.destroy_calls == 0
+
+
+def test_partial_scenario_cleanup_destroys_untracked_new_actors() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    existing_actor = _FakeActor(actor_id=1)
+    leaked_actor = _FakeActor(actor_id=2)
+    world = _FakeSettingsWorld([existing_actor])
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._world = world
+
+    adapter._snapshot_existing_actors()
+    world.actors.append(leaked_actor)
+    adapter._destroy_new_scenario_actors()
+
+    assert existing_actor.destroy_calls == 0
+    assert leaked_actor.destroy_calls == 1
+    assert adapter._pre_scenario_actor_ids is None
+
+
+def test_partial_scenario_cleanup_handles_empty_initial_world() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    leaked_actor = _FakeActor(actor_id=2)
+    world = _FakeSettingsWorld([])
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._world = world
+
+    adapter._snapshot_existing_actors()
+    world.actors.append(leaked_actor)
+    adapter._destroy_new_scenario_actors()
+
+    assert leaked_actor.destroy_calls == 1
 
 
 def test_start_scenario_runner_does_not_require_legacy_path() -> None:
@@ -343,6 +580,53 @@ class _FakeTrafficManager:
 
     def set_random_device_seed(self, seed):
         self.seed_calls.append(seed)
+
+
+class _FakeSettingsWorld:
+    def __init__(self, actors=None, synchronous_mode=False, fixed_delta_seconds=None):
+        self.settings = SimpleNamespace(
+            synchronous_mode=synchronous_mode,
+            no_rendering_mode=False,
+            fixed_delta_seconds=fixed_delta_seconds,
+        )
+        self.applied_settings = None
+        self.actors = list(actors or [])
+
+    def get_settings(self):
+        return self.settings
+
+    def apply_settings(self, settings):
+        self.applied_settings = settings
+
+    def get_actors(self):
+        return list(self.actors)
+
+
+class _FakeActor:
+    def __init__(self, actor_id, type_id="vehicle.test"):
+        self.id = actor_id
+        self.type_id = type_id
+        self.destroy_calls = 0
+
+    def destroy(self):
+        self.destroy_calls += 1
+
+
+class _FakeClient:
+    def __init__(self, world, traffic_manager=None):
+        self.world = world
+        self.traffic_manager = traffic_manager or _FakeTrafficManager()
+        self.generated = False
+
+    def get_world(self):
+        return self.world
+
+    def get_trafficmanager(self, port):
+        return self.traffic_manager
+
+    def generate_opendrive_world(self, *args, **kwargs):
+        self.generated = True
+        raise AssertionError("generate_opendrive_world should not be called")
 
 
 def test_vehicle_control_disables_autopilot_and_brake_overrides_throttle(monkeypatch) -> None:

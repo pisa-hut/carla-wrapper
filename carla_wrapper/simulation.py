@@ -68,7 +68,6 @@ class CarlaAdapter:
         self._server_version = None
         self._world = None
         self.config = None
-        self._original_settings = None
         self._output_base = None
         self._output_dir = None
         self._finalized = True
@@ -91,6 +90,7 @@ class CarlaAdapter:
         self._sr_ego_vehicles: list = []
         self._traffic_manager = None
         self._traffic_manager_sync_enabled = False
+        self._pre_scenario_actor_ids: set[int] | None = None
 
         self._server_log_path = "/mnt/output/carla_server"
         os.makedirs(self._server_log_path, exist_ok=True)
@@ -112,6 +112,9 @@ class CarlaAdapter:
         self._output_base = request.output_dir
         self.config = request.config
         self.scenario = request.scenario
+
+        if not self._finalized:
+            self._finalize()
 
         if not self._ensure_connected():
             return InitResponse(success=False, msg="Failed to connect to CARLA within timeout")
@@ -146,6 +149,9 @@ class CarlaAdapter:
         self._sr_ego_vehicles: list = []
         self._traffic_manager = None
         self._traffic_manager_sync_enabled = False
+        self._pre_scenario_actor_ids = None
+
+        self._prepare_reused_server_state()
 
         return InitResponse(success=True)
 
@@ -160,9 +166,17 @@ class CarlaAdapter:
             self._time_ns = 0
             self._quit_flag = False
             self._clear_collision_events()
+            self._pre_scenario_actor_ids = None
 
-            self._ensure_world(request.scenario_pack)
-            self._apply_world_settings()
+            scenario_format = self.scenario.format
+            use_scenario_runner_world_loading = scenario_format == "open_scenario1"
+            self._ensure_world(
+                request.scenario_pack,
+                generate_opendrive_world=not use_scenario_runner_world_loading,
+            )
+            self._clear_dynamic_actors()
+            if not use_scenario_runner_world_loading:
+                self._apply_world_settings()
 
             p = str((self._output_dir / "carla_recording.log").resolve())
             self._client.start_recorder(p)
@@ -213,7 +227,6 @@ class CarlaAdapter:
                 logger.exception("Failed to stop CARLA recorder")
 
         self._destroy_spawned_actors()
-        self._restore_world_settings()
         self._stop_scenario_runner_module()
 
         self._finalized = True
@@ -324,14 +337,25 @@ class CarlaAdapter:
 
         return True
 
-    def _ensure_world(self, sps: ScenarioPackData | None) -> None:
+    def _ensure_world(
+        self,
+        sps: ScenarioPackData | None,
+        generate_opendrive_world: bool = True,
+    ) -> None:
         if sps is None:
-            raise RuntimeError("ScenarioPack is required to generate CARLA world")
+            raise RuntimeError("ScenarioPack is required to prepare CARLA world")
 
         if self._server_version is None and not self._ensure_connected():
             raise RuntimeError("Failed to connect to CARLA before loading world")
         if self._client is None:
             raise RuntimeError("CARLA client is not available")
+
+        if not generate_opendrive_world:
+            world = self._client.get_world()
+            if world is None:
+                raise RuntimeError("CARLA world is not available")
+            self._world = world
+            return
 
         opendrive_name = sps.map_name
         if not opendrive_name:
@@ -374,7 +398,24 @@ class CarlaAdapter:
             world = self._client.get_world()
 
         self._world = world
-        self._original_settings = world.get_settings()
+
+    def _sync_world_from_scenario_runner(self) -> None:
+        if self._client is None:
+            raise RuntimeError("CARLA client is not available")
+
+        world = None
+        try:
+            world = CarlaDataProvider.get_world()
+        except Exception:
+            logger.exception("Failed to read CARLA world from CarlaDataProvider")
+
+        if world is None:
+            world = self._client.get_world()
+        if world is None:
+            raise RuntimeError("CARLA world is not available after ScenarioRunner setup")
+
+        self._world = world
+        CarlaDataProvider.set_world(world)
 
     def _apply_world_settings(self) -> None:
         if self._world is None:
@@ -389,14 +430,45 @@ class CarlaAdapter:
             settings.fixed_delta_seconds = float(self._fixed_delta_seconds)
         self._world.apply_settings(settings)
 
-    def _restore_world_settings(self) -> None:
-        if self._world is None or self._original_settings is None:
+    def _force_async_world_for_cleanup(self) -> None:
+        if self._world is None:
+            return
+
+        try:
+            settings = self._world.get_settings()
+            changed = False
+            if settings.synchronous_mode:
+                settings.synchronous_mode = False
+                changed = True
+            if settings.fixed_delta_seconds is not None:
+                settings.fixed_delta_seconds = None
+                changed = True
+            if changed:
+                self._world.apply_settings(settings)
+                logger.info("Forced CARLA world to async mode for cleanup")
+        except Exception:
+            logger.exception("Failed to force CARLA world to async mode for cleanup")
+
+        client = getattr(self, "_client", None)
+        if client is None:
             return
         try:
-            self._world.apply_settings(self._original_settings)
-            logger.info("Restored original CARLA world settings")
+            tm_port = getattr(self, "_scenario_runner_tm_port", 8000)
+            client.get_trafficmanager(tm_port).set_synchronous_mode(False)
         except Exception:
-            logger.exception("Failed to restore CARLA world settings")
+            logger.exception("Failed to force TrafficManager to async mode for cleanup")
+
+    def _prepare_reused_server_state(self) -> None:
+        if self._client is None:
+            return
+
+        try:
+            self._world = self._client.get_world()
+        except Exception:
+            logger.exception("Failed to get CARLA world while preparing reused server")
+            return
+
+        self._clear_dynamic_actors()
 
     def _destroy_spawned_actors(self) -> None:
         self._destroy_collision_sensor()
@@ -418,6 +490,78 @@ class CarlaAdapter:
         self._last_object_index_by_actor_id.clear()
         self._clear_collision_events()
 
+    def _is_dynamic_actor(self, actor) -> bool:
+        type_id = getattr(actor, "type_id", "")
+        return (
+            type_id.startswith("vehicle.")
+            or type_id.startswith("walker.")
+            or type_id.startswith("controller.ai.walker")
+            or type_id.startswith("sensor.")
+        )
+
+    def _clear_dynamic_actors(self) -> None:
+        logger.info("Clearing dynamic actors from CARLA world before scenario start")
+        if self._world is None:
+            return
+
+        self._force_async_world_for_cleanup()
+
+        try:
+            actors = list(self._world.get_actors())
+        except Exception:
+            logger.exception("Failed to list CARLA actors for reset cleanup")
+            return
+
+        destroyed_count = 0
+        for actor in actors:
+            if not self._is_dynamic_actor(actor):
+                continue
+            try:
+                actor.destroy()
+                destroyed_count += 1
+            except Exception:
+                logger.exception(
+                    "Failed to destroy dynamic actor %s",
+                    getattr(actor, "id", "<unknown>"),
+                )
+
+        if destroyed_count:
+            logger.info("Destroyed %s dynamic CARLA actors before reset", destroyed_count)
+
+    def _snapshot_existing_actors(self) -> None:
+        if self._world is None:
+            self._pre_scenario_actor_ids = None
+            return
+
+        try:
+            self._pre_scenario_actor_ids = {actor.id for actor in self._world.get_actors()}
+        except Exception:
+            logger.exception("Failed to snapshot CARLA actors before scenario start")
+            self._pre_scenario_actor_ids = None
+
+    def _destroy_new_scenario_actors(self) -> None:
+        if self._world is None or self._pre_scenario_actor_ids is None:
+            return
+
+        self._force_async_world_for_cleanup()
+
+        try:
+            actors = self._world.get_actors()
+        except Exception:
+            logger.exception("Failed to list CARLA actors for partial scenario cleanup")
+            return
+
+        for actor in actors:
+            actor_id = getattr(actor, "id", None)
+            if actor_id in self._pre_scenario_actor_ids:
+                continue
+            try:
+                actor.destroy()
+            except Exception:
+                logger.exception("Failed to destroy new scenario actor %s", actor_id)
+
+        self._pre_scenario_actor_ids = None
+
     def _start_scenario_runner(self, sps: ScenarioPackData, params: dict | None) -> None:
         self._start_scenario_runner_module(sps, params)
 
@@ -428,6 +572,8 @@ class CarlaAdapter:
     ) -> None:
         if self._client is None or self._world is None:
             raise RuntimeError("CARLA client/world not available")
+
+        self._snapshot_existing_actors()
 
         CarlaDataProvider.set_client(self._client)
         CarlaDataProvider.set_world(self._world)
@@ -455,6 +601,9 @@ class CarlaAdapter:
                 config = OpenScenarioConfiguration(
                     str(xosc_path), self._client, openscenario_params
                 )
+                self._sync_world_from_scenario_runner()
+                self._apply_world_settings()
+                CarlaDataProvider.set_world(self._world)
 
             case "carla_lb_route":
                 route_name = self.scenario.name
@@ -548,6 +697,7 @@ class CarlaAdapter:
                         "Failed to destroy partially spawned ego actor %s",
                         getattr(actor, "id", "<unknown>"),
                     )
+            self._destroy_new_scenario_actors()
 
         # Clean up data provider
         try:
