@@ -84,6 +84,13 @@ class CarlaAdapter:
         self._sr_ego_control_ticks = 0
         self._sr_ego_control_ticks_before_disable = 1
         self._quit_flag = False
+        self._spawned_actor_ids: set[int] = set()
+        self._sr_scenario = None
+        self._sr_tree = None
+        self._sr_running = False
+        self._sr_ego_vehicles: list = []
+        self._traffic_manager = None
+        self._traffic_manager_sync_enabled = False
 
         self._server_log_path = "/mnt/output/carla_server"
         os.makedirs(self._server_log_path, exist_ok=True)
@@ -122,7 +129,6 @@ class CarlaAdapter:
         self._quit_flag = False
 
         self._spawned_actor_ids: set[int] = set()
-        self._scenario_runner_path = self.config.get("scenario_runner_path", None)
         self._disable_sr_ego_control = bool(
             self.config.get("disable_scenario_runner_ego_control", True)
         )
@@ -138,6 +144,8 @@ class CarlaAdapter:
         self._sr_tree = None
         self._sr_running = False
         self._sr_ego_vehicles: list = []
+        self._traffic_manager = None
+        self._traffic_manager_sync_enabled = False
 
         return InitResponse(success=True)
 
@@ -145,32 +153,35 @@ class CarlaAdapter:
         if not self._finalized:
             self._finalize()
 
-        self._output_dir = self._output_base / request.output_dir
-        self._time_ns = 0
-        self._quit_flag = False
-        self._clear_collision_events()
-
-        self._ensure_world(request.scenario_pack)
-        self._apply_world_settings()
-
-        p = str((self._output_dir / "carla_recording.log").resolve())
-        self._client.start_recorder(p)
-        logger.info("Starting ScenarioRunner...")
-        self._start_scenario_runner(request.scenario_pack, request.params)
-
-        if self._ego_vehicle is None:
-            logger.warning("Ego vehicle not found after starting ScenarioRunner")
-
-        self._setup_collision_sensor()
-        self._tick_scenario_runner_module()
-        if self._sync:
-            self._world.tick()
-
-        frame = self._collect_runtime_frame()
-
         self._finalized = False
 
-        return frame
+        try:
+            self._output_dir = self._output_base / request.output_dir
+            self._time_ns = 0
+            self._quit_flag = False
+            self._clear_collision_events()
+
+            self._ensure_world(request.scenario_pack)
+            self._apply_world_settings()
+
+            p = str((self._output_dir / "carla_recording.log").resolve())
+            self._client.start_recorder(p)
+            logger.info("Starting ScenarioRunner...")
+            self._start_scenario_runner(request.scenario_pack, request.params)
+
+            if self._ego_vehicle is None:
+                logger.warning("Ego vehicle not found after starting ScenarioRunner")
+
+            self._setup_collision_sensor()
+            self._tick_scenario_runner_module()
+            if self._sync:
+                self._world.tick()
+
+            return self._collect_runtime_frame()
+        except Exception:
+            logger.exception("Failed to reset CARLA simulation; finalizing partial state")
+            self._finalize()
+            raise
 
     def step(self, request: StepRequest) -> RuntimeFrameData:
         if self._world is None:
@@ -195,15 +206,15 @@ class CarlaAdapter:
         logger.info("CARLA simulator stopped.")
 
     def _finalize(self):
-        try:
-            if self._client is not None:
+        if self._client is not None:
+            try:
                 self._client.stop_recorder()
-            self._destroy_collision_sensor()
-            self._restore_world_settings()
-            self._stop_scenario_runner_module()
-            self._clear_spawned_actor_tracking()
-        except Exception:
-            logger.exception("Error during CARLA finalization")
+            except Exception:
+                logger.exception("Failed to stop CARLA recorder")
+
+        self._destroy_spawned_actors()
+        self._restore_world_settings()
+        self._stop_scenario_runner_module()
 
         self._finalized = True
         logger.info("CARLA service finalized.")
@@ -248,7 +259,7 @@ class CarlaAdapter:
                 self._ego_vehicle.set_simulate_physics(True)
             except Exception:
                 logger.exception("Failed to enable ego vehicle physics")
-        
+
         self._external_control_prepared_actor_id = actor_id
 
     def _clear_ego_vehicle_control(self, reason: str) -> None:
@@ -274,8 +285,6 @@ class CarlaAdapter:
             "steer": 0.0,
         }
 
-
-
     # def _ensure_connected(self) -> bool:
     #     t = self.config.get("carla_connect_timeout_seconds", 10)
     #     retry_interval = self.config.get("retry_interval_seconds", 2)
@@ -291,7 +300,7 @@ class CarlaAdapter:
     #             continue
     #         return True
     #     return True
-    
+
     def _ensure_connected(self) -> bool:
         timeout = self.config.get("carla_connect_timeout_seconds", 10)
         retry_interval = self.config.get("retry_interval_seconds", 2)
@@ -310,20 +319,23 @@ class CarlaAdapter:
                     logger.error("Failed to connect to CARLA: connection timeout.")
                     return False
 
-                logger.error(
-                    f"Failed to connect to CARLA, retrying in {retry_interval} seconds..."
-                )
+                logger.error(f"Failed to connect to CARLA, retrying in {retry_interval} seconds...")
                 time.sleep(retry_interval)
 
         return True
-        
-
 
     def _ensure_world(self, sps: ScenarioPackData | None) -> None:
-        if self._server_version is None:
-            self._ensure_connected()
+        if sps is None:
+            raise RuntimeError("ScenarioPack is required to generate CARLA world")
+
+        if self._server_version is None and not self._ensure_connected():
+            raise RuntimeError("Failed to connect to CARLA before loading world")
+        if self._client is None:
+            raise RuntimeError("CARLA client is not available")
 
         opendrive_name = sps.map_name
+        if not opendrive_name:
+            raise RuntimeError("ScenarioPack map_name is required to generate CARLA world")
         opendrive_path = Path(f"/mnt/map/xodr/{opendrive_name}.xodr").resolve()
 
         world = None
@@ -362,8 +374,7 @@ class CarlaAdapter:
             world = self._client.get_world()
 
         self._world = world
-        if self._original_settings is None:
-            self._original_settings = world.get_settings()
+        self._original_settings = world.get_settings()
 
     def _apply_world_settings(self) -> None:
         if self._world is None:
@@ -390,32 +401,24 @@ class CarlaAdapter:
     def _destroy_spawned_actors(self) -> None:
         self._destroy_collision_sensor()
 
-        if self._world is not None:
-            for actor_id in list(self._spawned_actor_ids):
-                actor = self._world.get_actor(actor_id)
+        spawned_actor_ids = getattr(self, "_spawned_actor_ids", set())
+        world = getattr(self, "_world", None)
+        if world is not None:
+            for actor_id in list(spawned_actor_ids):
+                actor = world.get_actor(actor_id)
                 if actor is not None:
                     try:
                         actor.destroy()
                     except Exception:
                         logger.exception("Failed to destroy actor %s", actor_id)
 
-        self._spawned_actor_ids.clear()
-        self._objects_by_id.clear()
-        self._prev_yaw_rate.clear()
-        self._last_object_index_by_actor_id.clear()
-        self._clear_collision_events()
-
-    def _clear_spawned_actor_tracking(self) -> None:
-        self._spawned_actor_ids.clear()
+        spawned_actor_ids.clear()
         self._objects_by_id.clear()
         self._prev_yaw_rate.clear()
         self._last_object_index_by_actor_id.clear()
         self._clear_collision_events()
 
     def _start_scenario_runner(self, sps: ScenarioPackData, params: dict | None) -> None:
-        if self._scenario_runner_path is None:
-            raise RuntimeError("scenario_runner_path is required when use_scenario_runner")
-
         self._start_scenario_runner_module(sps, params)
 
     def _start_scenario_runner_module(
@@ -430,9 +433,12 @@ class CarlaAdapter:
         CarlaDataProvider.set_world(self._world)
         CarlaDataProvider.set_traffic_manager_port(self._scenario_runner_tm_port)
         tm = self._client.get_trafficmanager(self._scenario_runner_tm_port)
+        self._traffic_manager = tm
+        self._traffic_manager_sync_enabled = False
         tm.set_random_device_seed(self._scenario_runner_tm_seed)
         if self._sync:
             tm.set_synchronous_mode(True)
+            self._traffic_manager_sync_enabled = True
 
         match self.scenario.format:
             case "open_scenario1":
@@ -440,9 +446,11 @@ class CarlaAdapter:
                 if params:
                     openscenario_params = {str(k): str(v) for k, v in params.items()}
                 xosc_name = sps.name
+                if not xosc_name:
+                    raise RuntimeError("ScenarioPack name is required for open_scenario1")
                 xosc_path = Path(f"/mnt/scenario/{xosc_name}.xosc").resolve()
-                if xosc_path is None:
-                    raise RuntimeError("ScenarioPack has no xosc scenario to run")
+                if not xosc_path.exists():
+                    raise RuntimeError(f"OpenSCENARIO file not found: {xosc_path}")
 
                 config = OpenScenarioConfiguration(
                     str(xosc_path), self._client, openscenario_params
@@ -475,6 +483,7 @@ class CarlaAdapter:
                     if actor is None:
                         raise RuntimeError(f"Failed to spawn ego vehicle '{ego_config.rolename}'")
                     ego_vehicles.append(actor)
+                    self._sr_ego_vehicles = ego_vehicles
                 logger.debug(f"Spawned {len(ego_vehicles)} ego vehicles for scenario")
 
                 scenario = OpenScenario(
@@ -502,6 +511,8 @@ class CarlaAdapter:
         self._sr_running = True
 
     def _stop_scenario_runner_module(self) -> None:
+        self._restore_traffic_manager_settings()
+
         if self._sr_scenario is None and self._sr_tree is None and not self._sr_ego_vehicles:
             logger.info("ScenarioRunner not running, no need to stop")
             return
@@ -528,6 +539,16 @@ class CarlaAdapter:
         except Exception:
             logger.exception("Failed to remove ScenarioRunner actors")
 
+        if self._sr_scenario is None:
+            for actor in self._sr_ego_vehicles:
+                try:
+                    actor.destroy()
+                except Exception:
+                    logger.exception(
+                        "Failed to destroy partially spawned ego actor %s",
+                        getattr(actor, "id", "<unknown>"),
+                    )
+
         # Clean up data provider
         try:
             CarlaDataProvider.cleanup()
@@ -545,6 +566,20 @@ class CarlaAdapter:
         self._sr_running = False
         self._sr_ego_vehicles = []
         logger.info("ScenarioRunner cleanup complete")
+
+    def _restore_traffic_manager_settings(self) -> None:
+        if self._traffic_manager is None:
+            return
+
+        if self._traffic_manager_sync_enabled:
+            try:
+                self._traffic_manager.set_synchronous_mode(False)
+                logger.info("Restored TrafficManager synchronous mode")
+            except Exception:
+                logger.exception("Failed to restore TrafficManager synchronous mode")
+
+        self._traffic_manager = None
+        self._traffic_manager_sync_enabled = False
 
     def _tick_scenario_runner_module(self) -> None:
         if self._world is None:
@@ -1010,11 +1045,7 @@ class CarlaAdapter:
         elif ctrl.mode == ControlMode.POSITION:
             transform = self._ego_vehicle.get_transform()
             x = float(payload.get("x", transform.location.x))
-            y = (
-                float(payload["y"]) * self._yaw_sign
-                if "y" in payload
-                else transform.location.y
-            )
+            y = float(payload["y"]) * self._yaw_sign if "y" in payload else transform.location.y
             z = float(payload.get("z", transform.location.z))
             h = float(payload.get("h", self._from_carla_yaw(transform.rotation.yaw)))
             yaw_deg = self._to_carla_yaw(h)

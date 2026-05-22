@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 from pisa_api.simulator import ControlCommand, ControlMode, RuntimeFrameData, StepRequest
 
 
@@ -125,21 +126,141 @@ def test_finalize_destroys_collision_sensor_before_scenario_runner_cleanup() -> 
     calls = []
     adapter = CarlaAdapter.__new__(CarlaAdapter)
     adapter._client = SimpleNamespace(stop_recorder=lambda: calls.append("stop_recorder"))
-    adapter._destroy_collision_sensor = lambda: calls.append("destroy_collision_sensor")
+    adapter._destroy_spawned_actors = lambda: calls.append("destroy_spawned_actors")
     adapter._restore_world_settings = lambda: calls.append("restore_world_settings")
     adapter._stop_scenario_runner_module = lambda: calls.append("stop_scenario_runner")
-    adapter._clear_spawned_actor_tracking = lambda: calls.append("clear_tracking")
 
     adapter._finalize()
 
     assert calls == [
         "stop_recorder",
-        "destroy_collision_sensor",
+        "destroy_spawned_actors",
         "restore_world_settings",
         "stop_scenario_runner",
-        "clear_tracking",
     ]
     assert adapter._finalized is True
+
+
+def test_finalize_continues_after_recorder_stop_failure() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    calls = []
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._client = SimpleNamespace(
+        stop_recorder=lambda: (_ for _ in ()).throw(RuntimeError("recorder failed"))
+    )
+    adapter._destroy_spawned_actors = lambda: calls.append("destroy_spawned_actors")
+    adapter._restore_world_settings = lambda: calls.append("restore_world_settings")
+    adapter._stop_scenario_runner_module = lambda: calls.append("stop_scenario_runner")
+
+    adapter._finalize()
+
+    assert calls == [
+        "destroy_spawned_actors",
+        "restore_world_settings",
+        "stop_scenario_runner",
+    ]
+    assert adapter._finalized is True
+
+
+def test_reset_finalizes_partial_state_on_failure(tmp_path) -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    calls = []
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._finalized = True
+    adapter._output_base = tmp_path
+    adapter._clear_collision_events = lambda: calls.append("clear_collision_events")
+    adapter._ensure_world = lambda scenario_pack: calls.append(("ensure_world", scenario_pack))
+    adapter._apply_world_settings = lambda: calls.append("apply_world_settings")
+    adapter._client = SimpleNamespace(start_recorder=lambda path: calls.append(("recorder", path)))
+    adapter._start_scenario_runner = lambda scenario_pack, params: (_ for _ in ()).throw(
+        RuntimeError("scenario failed")
+    )
+    adapter._finalize = lambda: calls.append("finalize")
+
+    request = SimpleNamespace(output_dir="run", scenario_pack=object(), params={})
+
+    with pytest.raises(RuntimeError, match="scenario failed"):
+        adapter.reset(request)
+
+    assert calls[-1] == "finalize"
+
+
+def test_ensure_world_requires_scenario_pack() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+
+    with pytest.raises(RuntimeError, match="ScenarioPack is required"):
+        adapter._ensure_world(None)
+
+
+def test_ensure_world_stops_when_reconnect_fails() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._server_version = None
+    adapter._client = None
+    adapter._ensure_connected = lambda: False
+
+    with pytest.raises(RuntimeError, match="Failed to connect to CARLA"):
+        adapter._ensure_world(SimpleNamespace(map_name="Town01"))
+
+
+def test_open_scenario_missing_xosc_fails_before_scenario_runner(monkeypatch) -> None:
+    from carla_wrapper import simulation
+
+    traffic_manager = _FakeTrafficManager()
+    monkeypatch.setattr(
+        simulation,
+        "CarlaDataProvider",
+        SimpleNamespace(
+            set_client=lambda client: None,
+            set_world=lambda world: None,
+            set_traffic_manager_port=lambda port: None,
+        ),
+    )
+
+    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
+    adapter._client = SimpleNamespace(get_trafficmanager=lambda port: traffic_manager)
+    adapter._world = object()
+    adapter._scenario_runner_tm_port = 8000
+    adapter._scenario_runner_tm_seed = 0
+    adapter._sync = True
+    adapter._traffic_manager = None
+    adapter._traffic_manager_sync_enabled = False
+    adapter.scenario = SimpleNamespace(format="open_scenario1")
+
+    with pytest.raises(RuntimeError, match="OpenSCENARIO file not found"):
+        adapter._start_scenario_runner_module(SimpleNamespace(name="missing"), {})
+
+
+def test_start_scenario_runner_does_not_require_legacy_path() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    calls = []
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._start_scenario_runner_module = lambda sps, params: calls.append((sps, params))
+
+    adapter._start_scenario_runner("scenario_pack", {"k": "v"})
+
+    assert calls == [("scenario_pack", {"k": "v"})]
+
+
+def test_restore_traffic_manager_disables_sync_when_wrapper_enabled_it() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    traffic_manager = _FakeTrafficManager()
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._traffic_manager = traffic_manager
+    adapter._traffic_manager_sync_enabled = True
+
+    adapter._restore_traffic_manager_settings()
+
+    assert traffic_manager.sync_calls == [False]
+    assert adapter._traffic_manager is None
+    assert adapter._traffic_manager_sync_enabled is False
 
 
 def test_stop_does_not_call_carla_after_finalize() -> None:
@@ -210,6 +331,18 @@ class _FakeController:
 
     def reset(self):
         self.reset_calls += 1
+
+
+class _FakeTrafficManager:
+    def __init__(self):
+        self.sync_calls = []
+        self.seed_calls = []
+
+    def set_synchronous_mode(self, enabled):
+        self.sync_calls.append(enabled)
+
+    def set_random_device_seed(self, seed):
+        self.seed_calls.append(seed)
 
 
 def test_vehicle_control_disables_autopilot_and_brake_overrides_throttle(monkeypatch) -> None:
@@ -345,9 +478,7 @@ class _FakeVehicle:
         return SimpleNamespace(x=self.forward_speed, y=0.0, z=0.0)
 
     def get_transform(self):
-        return SimpleNamespace(
-            get_forward_vector=lambda: SimpleNamespace(x=1.0, y=0.0, z=0.0)
-        )
+        return SimpleNamespace(get_forward_vector=lambda: SimpleNamespace(x=1.0, y=0.0, z=0.0))
 
 
 class _FakeVehicleControl:
