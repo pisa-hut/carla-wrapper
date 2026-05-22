@@ -119,6 +119,52 @@ def test_scenario_runner_ego_control_is_disabled_after_configured_ticks(monkeypa
     assert ego_controller.reset_calls == 1
 
 
+def test_finalize_destroys_collision_sensor_before_scenario_runner_cleanup() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    calls = []
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._client = SimpleNamespace(stop_recorder=lambda: calls.append("stop_recorder"))
+    adapter._destroy_collision_sensor = lambda: calls.append("destroy_collision_sensor")
+    adapter._restore_world_settings = lambda: calls.append("restore_world_settings")
+    adapter._stop_scenario_runner_module = lambda: calls.append("stop_scenario_runner")
+    adapter._clear_spawned_actor_tracking = lambda: calls.append("clear_tracking")
+
+    adapter._finalize()
+
+    assert calls == [
+        "stop_recorder",
+        "destroy_collision_sensor",
+        "restore_world_settings",
+        "stop_scenario_runner",
+        "clear_tracking",
+    ]
+    assert adapter._finalized is True
+
+
+def test_stop_does_not_call_carla_after_finalize() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._finalize = lambda: None
+    adapter._world = SimpleNamespace(
+        apply_settings=lambda settings: (_ for _ in ()).throw(
+            AssertionError("stop must not call CARLA after finalize")
+        )
+    )
+    adapter._original_settings = object()
+    adapter._client = object()
+    adapter._server_version = "test"
+    adapter._ego_vehicle = object()
+
+    adapter.stop()
+
+    assert adapter._world is None
+    assert adapter._client is None
+    assert adapter._server_version is None
+    assert adapter._ego_vehicle is None
+
+
 class _FakeWorld:
     def __init__(self, calls):
         self._calls = calls

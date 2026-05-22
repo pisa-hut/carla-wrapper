@@ -187,15 +187,6 @@ class CarlaAdapter:
 
     def stop(self) -> None:
         self._finalize()
-        try:
-            self._destroy_spawned_actors()
-        finally:
-            self._stop_scenario_runner_module()
-            if self._world is not None and self._original_settings is not None:
-                try:
-                    self._world.apply_settings(self._original_settings)
-                except Exception:
-                    logger.exception("Failed to restore CARLA world settings")
 
         self._ego_vehicle = None
         self._world = None
@@ -207,8 +198,10 @@ class CarlaAdapter:
         try:
             if self._client is not None:
                 self._client.stop_recorder()
-            self._destroy_spawned_actors()
+            self._destroy_collision_sensor()
+            self._restore_world_settings()
             self._stop_scenario_runner_module()
+            self._clear_spawned_actor_tracking()
         except Exception:
             logger.exception("Error during CARLA finalization")
 
@@ -283,21 +276,47 @@ class CarlaAdapter:
 
 
 
+    # def _ensure_connected(self) -> bool:
+    #     t = self.config.get("carla_connect_timeout_seconds", 10)
+    #     retry_interval = self.config.get("retry_interval_seconds", 2)
+    #     while t > 0 and self._server_version is None:
+    #         try:
+    #             self._connect(2)
+    #         except Exception:
+    #             logger.error(f"Failed to connect to CARLA, retrying in {retry_interval} seconds...")
+    #             time.sleep(retry_interval)
+    #             t -= retry_interval
+    #             if t <= 0:
+    #                 return False
+    #             continue
+    #         return True
+    #     return True
+    
     def _ensure_connected(self) -> bool:
-        t = self.config.get("carla_connect_timeout_seconds", 10)
+        timeout = self.config.get("carla_connect_timeout_seconds", 10)
         retry_interval = self.config.get("retry_interval_seconds", 2)
-        while t > 0 and self._server_version is None:
+
+        end_time = time.time() + timeout
+
+        while self._server_version is None:
             try:
                 self._connect(2)
+                return True
+
             except Exception:
-                logger.error(f"Failed to connect to CARLA, retrying in {retry_interval} seconds...")
-                time.sleep(retry_interval)
-                t -= retry_interval
-                if t <= 0:
+                remaining = end_time - time.time()
+
+                if remaining <= 0:
+                    logger.error("Failed to connect to CARLA: connection timeout.")
                     return False
-                continue
-            
-            return True
+
+                logger.error(
+                    f"Failed to connect to CARLA, retrying in {retry_interval} seconds..."
+                )
+                time.sleep(retry_interval)
+
+        return True
+        
 
 
     def _ensure_world(self, sps: ScenarioPackData | None) -> None:
@@ -359,6 +378,15 @@ class CarlaAdapter:
             settings.fixed_delta_seconds = float(self._fixed_delta_seconds)
         self._world.apply_settings(settings)
 
+    def _restore_world_settings(self) -> None:
+        if self._world is None or self._original_settings is None:
+            return
+        try:
+            self._world.apply_settings(self._original_settings)
+            logger.info("Restored original CARLA world settings")
+        except Exception:
+            logger.exception("Failed to restore CARLA world settings")
+
     def _destroy_spawned_actors(self) -> None:
         self._destroy_collision_sensor()
 
@@ -371,6 +399,13 @@ class CarlaAdapter:
                     except Exception:
                         logger.exception("Failed to destroy actor %s", actor_id)
 
+        self._spawned_actor_ids.clear()
+        self._objects_by_id.clear()
+        self._prev_yaw_rate.clear()
+        self._last_object_index_by_actor_id.clear()
+        self._clear_collision_events()
+
+    def _clear_spawned_actor_tracking(self) -> None:
         self._spawned_actor_ids.clear()
         self._objects_by_id.clear()
         self._prev_yaw_rate.clear()
@@ -471,33 +506,27 @@ class CarlaAdapter:
             logger.info("ScenarioRunner not running, no need to stop")
             return
 
-        # Explicitly destroy ego vehicles
-        for ego in self._sr_ego_vehicles:
-            if ego is not None and self._world is not None:
-                try:
-                    if ego in self._world.get_actors():
-                        ego.destroy()
-                except Exception:
-                    logger.exception(
-                        "Failed to destroy ego vehicle %s",
-                        ego.id if hasattr(ego, "id") else "unknown",
-                    )
-
-        # Terminate scenario
-        try:
-            if self._sr_scenario is not None:
-                self._sr_scenario.remove_all_actors()
-                self._sr_scenario.terminate()
-                logger.info("Scenario terminated successfully")
-        except Exception:
-            logger.exception("Failed to terminate scenario")
-
         try:
             if self._sr_tree is not None:
                 self._sr_tree.stop(py_trees.common.Status.INVALID)
                 logger.info("Scenario tree stopped successfully")
         except Exception:
             logger.exception("Failed to stop scenario tree")
+
+        # Terminate scenario
+        try:
+            if self._sr_scenario is not None:
+                self._sr_scenario.terminate()
+                logger.info("Scenario terminated successfully")
+        except Exception:
+            logger.exception("Failed to terminate scenario")
+
+        try:
+            if self._sr_scenario is not None:
+                self._sr_scenario.remove_all_actors()
+                logger.info("Scenario actors removed successfully")
+        except Exception:
+            logger.exception("Failed to remove ScenarioRunner actors")
 
         # Clean up data provider
         try:
@@ -940,7 +969,7 @@ class CarlaAdapter:
                     acceleration=acceleration,
                     jerk=jerk,
                 )
-                
+
                 self._ego_vehicle.apply_ackermann_control(control)
                 applied_payload = {
                     "mode": ctrl.mode.name,
