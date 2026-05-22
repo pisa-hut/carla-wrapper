@@ -298,22 +298,6 @@ class CarlaAdapter:
             "steer": 0.0,
         }
 
-    # def _ensure_connected(self) -> bool:
-    #     t = self.config.get("carla_connect_timeout_seconds", 10)
-    #     retry_interval = self.config.get("retry_interval_seconds", 2)
-    #     while t > 0 and self._server_version is None:
-    #         try:
-    #             self._connect(2)
-    #         except Exception:
-    #             logger.error(f"Failed to connect to CARLA, retrying in {retry_interval} seconds...")
-    #             time.sleep(retry_interval)
-    #             t -= retry_interval
-    #             if t <= 0:
-    #                 return False
-    #             continue
-    #         return True
-    #     return True
-
     def _ensure_connected(self) -> bool:
         timeout = self.config.get("carla_connect_timeout_seconds", 10)
         retry_interval = self.config.get("retry_interval_seconds", 2)
@@ -565,6 +549,57 @@ class CarlaAdapter:
     def _start_scenario_runner(self, sps: ScenarioPackData, params: dict | None) -> None:
         self._start_scenario_runner_module(sps, params)
 
+    def _prepare_open_scenario_config(
+        self,
+        sps: ScenarioPackData,
+        params: dict | None,
+    ):
+        openscenario_params: dict[str, str] = {}
+        if params:
+            openscenario_params = {str(k): str(v) for k, v in params.items()}
+
+        xosc_name = sps.name
+        if not xosc_name:
+            raise RuntimeError("ScenarioPack name is required for open_scenario1")
+        xosc_path = Path(f"/mnt/scenario/{xosc_name}.xosc").resolve()
+        if not xosc_path.exists():
+            raise RuntimeError(f"OpenSCENARIO file not found: {xosc_path}")
+
+        config = OpenScenarioConfiguration(str(xosc_path), self._client, openscenario_params)
+        self._sync_world_from_scenario_runner()
+        self._apply_world_settings()
+        CarlaDataProvider.set_world(self._world)
+        return config, xosc_path
+
+    def _build_open_scenario(self, config, xosc_path: Path, sps: ScenarioPackData):
+        ego_vehicles = []
+        for ego_config in config.ego_vehicles:
+            actor = CarlaDataProvider.request_new_actor(
+                ego_config.model,
+                ego_config.transform,
+                ego_config.rolename,
+                random_location=ego_config.random_location,
+                color=ego_config.color,
+                actor_category=ego_config.category,
+            )
+            if actor is None:
+                raise RuntimeError(f"Failed to spawn ego vehicle '{ego_config.rolename}'")
+            ego_vehicles.append(actor)
+            self._sr_ego_vehicles = ego_vehicles
+        logger.debug("Spawned %s ego vehicles for scenario", len(ego_vehicles))
+
+        scenario = OpenScenario(
+            world=self._world,
+            ego_vehicles=ego_vehicles,
+            config=config,
+            config_file=str(xosc_path),
+            timeout=sps.timeout_ns / 1e9 if sps.timeout_ns > 0 else 10000.0,
+        )
+
+        self._sr_ego_vehicles = ego_vehicles
+        self._ego_vehicle = ego_vehicles[0]
+        return scenario
+
     def _start_scenario_runner_module(
         self,
         sps: ScenarioPackData,
@@ -588,22 +623,7 @@ class CarlaAdapter:
 
         match self.scenario.format:
             case "open_scenario1":
-                openscenario_params: dict[str, str] = {}
-                if params:
-                    openscenario_params = {str(k): str(v) for k, v in params.items()}
-                xosc_name = sps.name
-                if not xosc_name:
-                    raise RuntimeError("ScenarioPack name is required for open_scenario1")
-                xosc_path = Path(f"/mnt/scenario/{xosc_name}.xosc").resolve()
-                if not xosc_path.exists():
-                    raise RuntimeError(f"OpenSCENARIO file not found: {xosc_path}")
-
-                config = OpenScenarioConfiguration(
-                    str(xosc_path), self._client, openscenario_params
-                )
-                self._sync_world_from_scenario_runner()
-                self._apply_world_settings()
-                CarlaDataProvider.set_world(self._world)
+                config, xosc_path = self._prepare_open_scenario_config(sps, params)
 
             case "carla_lb_route":
                 route_name = self.scenario.name
@@ -619,32 +639,7 @@ class CarlaAdapter:
 
         match self.scenario.format:
             case "open_scenario1":
-                ego_vehicles = []
-                for ego_config in config.ego_vehicles:
-                    actor = CarlaDataProvider.request_new_actor(
-                        ego_config.model,
-                        ego_config.transform,
-                        ego_config.rolename,
-                        random_location=ego_config.random_location,
-                        color=ego_config.color,
-                        actor_category=ego_config.category,
-                    )
-                    if actor is None:
-                        raise RuntimeError(f"Failed to spawn ego vehicle '{ego_config.rolename}'")
-                    ego_vehicles.append(actor)
-                    self._sr_ego_vehicles = ego_vehicles
-                logger.debug(f"Spawned {len(ego_vehicles)} ego vehicles for scenario")
-
-                scenario = OpenScenario(
-                    world=self._world,
-                    ego_vehicles=ego_vehicles,
-                    config=config,
-                    config_file=str(xosc_path),
-                    timeout=sps.timeout_ns / 1e9 if sps.timeout_ns > 0 else 10000.0,
-                )
-
-                self._sr_ego_vehicles = ego_vehicles
-                self._ego_vehicle = ego_vehicles[0]
+                scenario = self._build_open_scenario(config, xosc_path, sps)
 
             case "carla_lb_route":
                 scenario = RouteScenario(world=self._world, config=config)
@@ -664,40 +659,38 @@ class CarlaAdapter:
 
         if self._sr_scenario is None and self._sr_tree is None and not self._sr_ego_vehicles:
             logger.info("ScenarioRunner not running, no need to stop")
-            return
+        else:
+            try:
+                if self._sr_tree is not None:
+                    self._sr_tree.stop(py_trees.common.Status.INVALID)
+                    logger.info("Scenario tree stopped successfully")
+            except Exception:
+                logger.exception("Failed to stop scenario tree")
 
-        try:
-            if self._sr_tree is not None:
-                self._sr_tree.stop(py_trees.common.Status.INVALID)
-                logger.info("Scenario tree stopped successfully")
-        except Exception:
-            logger.exception("Failed to stop scenario tree")
+            try:
+                if self._sr_scenario is not None:
+                    self._sr_scenario.terminate()
+                    logger.info("Scenario terminated successfully")
+            except Exception:
+                logger.exception("Failed to terminate scenario")
 
-        # Terminate scenario
-        try:
-            if self._sr_scenario is not None:
-                self._sr_scenario.terminate()
-                logger.info("Scenario terminated successfully")
-        except Exception:
-            logger.exception("Failed to terminate scenario")
+            try:
+                if self._sr_scenario is not None:
+                    self._sr_scenario.remove_all_actors()
+                    logger.info("Scenario actors removed successfully")
+            except Exception:
+                logger.exception("Failed to remove ScenarioRunner actors")
 
-        try:
-            if self._sr_scenario is not None:
-                self._sr_scenario.remove_all_actors()
-                logger.info("Scenario actors removed successfully")
-        except Exception:
-            logger.exception("Failed to remove ScenarioRunner actors")
-
-        if self._sr_scenario is None:
-            for actor in self._sr_ego_vehicles:
-                try:
-                    actor.destroy()
-                except Exception:
-                    logger.exception(
-                        "Failed to destroy partially spawned ego actor %s",
-                        getattr(actor, "id", "<unknown>"),
-                    )
-            self._destroy_new_scenario_actors()
+            if self._sr_scenario is None:
+                for actor in self._sr_ego_vehicles:
+                    try:
+                        actor.destroy()
+                    except Exception:
+                        logger.exception(
+                            "Failed to destroy partially spawned ego actor %s",
+                            getattr(actor, "id", "<unknown>"),
+                        )
+                self._destroy_new_scenario_actors()
 
         # Clean up data provider
         try:
