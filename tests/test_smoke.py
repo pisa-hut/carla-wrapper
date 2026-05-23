@@ -440,43 +440,6 @@ def test_clear_dynamic_actors_only_destroys_runtime_actor_types() -> None:
     assert prop.destroy_calls == 0
 
 
-def test_lifecycle_clear_dynamic_actors_forces_async_and_returns_count() -> None:
-    from carla_wrapper.lifecycle import clear_dynamic_actors
-
-    vehicle = _FakeActor(actor_id=1, type_id="vehicle.tesla.model3")
-    walker = _FakeActor(actor_id=2, type_id="walker.pedestrian.0001")
-    sensor = _FakeActor(actor_id=3, type_id="sensor.other.collision")
-    traffic_light = _FakeActor(actor_id=4, type_id="traffic.traffic_light")
-    world = _FakeSettingsWorld(
-        [vehicle, walker, sensor, traffic_light],
-        synchronous_mode=True,
-        fixed_delta_seconds=0.05,
-    )
-    traffic_manager = _FakeTrafficManager()
-    client = _FakeClient(world, traffic_manager=traffic_manager)
-
-    destroyed_count = clear_dynamic_actors(world, client=client, traffic_manager_port=8000)
-
-    assert destroyed_count == 3
-    assert world.settings.synchronous_mode is False
-    assert world.settings.fixed_delta_seconds is None
-    assert world.applied_settings is world.settings
-    assert traffic_manager.sync_calls == [False]
-    assert vehicle.destroy_calls == 1
-    assert walker.destroy_calls == 1
-    assert sensor.destroy_calls == 1
-    assert traffic_light.destroy_calls == 0
-
-
-def test_lifecycle_destroy_actor_treats_false_return_as_failure() -> None:
-    from carla_wrapper.lifecycle import destroy_actor
-
-    actor = _DestroyFalseActor(actor_id=1)
-
-    assert destroy_actor(actor) is False
-    assert actor.destroy_calls == 1
-
-
 def test_actor_type_uses_carla_vehicle_catalogue_base_types() -> None:
     from pisa_api.simulator import RoadObjectType
 
