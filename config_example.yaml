@@ -1,0 +1,108 @@
+# Example Carla Wrapper configuration.
+#
+# Keep this file as a flat key/value mapping if it is loaded directly into
+# InitRequest.config. The wrapper reads these keys with config.get("<key>").
+
+# -----------------------------------------------------------------------------
+# CARLA world execution
+# -----------------------------------------------------------------------------
+
+# Enable CARLA synchronous mode for deterministic stepping.
+# Recommended for simulator API usage because step() drives the world tick.
+synchronous_mode: true
+
+# Disable rendering on the CARLA server side.
+# Use true for faster headless runs when camera/display rendering is not needed.
+no_rendering_mode: false
+
+
+# -----------------------------------------------------------------------------
+# Coordinate convention
+# -----------------------------------------------------------------------------
+
+# Multiplier applied to lateral/yaw-related values when converting between the
+# external simulator API convention and CARLA. Keep 1.0 unless your caller uses
+# the opposite Y/yaw convention.
+yaw_sign: 1.0
+
+# Constant yaw offset, in degrees, applied during heading conversion.
+# Keep 0.0 unless integrating with a coordinate frame that has a fixed heading
+# offset relative to CARLA.
+yaw_offset_deg: 0.0
+
+
+# -----------------------------------------------------------------------------
+# CARLA connection retry
+# -----------------------------------------------------------------------------
+
+# Total number of seconds init() will spend retrying the CARLA connection before
+# returning InitResponse(success=false).
+carla_connect_timeout_seconds: 10
+
+# Seconds to sleep between CARLA connection attempts during init().
+retry_interval_seconds: 2
+
+
+# -----------------------------------------------------------------------------
+# ScenarioRunner control ownership
+# -----------------------------------------------------------------------------
+
+# Remove ScenarioRunner's controller for the ego vehicle before applying
+# external ControlCommand input. This avoids ScenarioRunner and the wrapper both
+# writing ego control in the same tick.
+disable_scenario_runner_ego_control: true
+
+# Number of ScenarioRunner ticks to allow before removing its ego controller.
+# 1 lets ScenarioRunner finish initial setup, then hands control to the wrapper.
+scenario_runner_ego_control_ticks_before_disable: 1
+
+
+# -----------------------------------------------------------------------------
+# TrafficManager
+# -----------------------------------------------------------------------------
+
+# Random seed passed to CARLA TrafficManager when ScenarioRunner is started.
+# Use a fixed value for reproducible traffic behavior.
+scenario_runner_tm_seed: 0
+
+
+# -----------------------------------------------------------------------------
+# Ackermann control
+# -----------------------------------------------------------------------------
+
+# Use CARLA's native VehicleAckermannControl backend for ACKERMANN commands.
+# When false, the wrapper converts target speed/steer into VehicleControl
+# throttle, brake, and normalized steer.
+ackermann_use_native_control: false
+
+# Proportional gain used by the fallback VehicleControl backend to convert
+# speed error into throttle.
+ackermann_speed_kp: 0.35
+
+# Minimum non-zero throttle used by the fallback VehicleControl backend when the
+# target speed is positive and acceleration is requested.
+ackermann_min_throttle: 0.2
+
+# Default acceleration value used for ACKERMANN commands when the payload omits
+# "acceleration". Passed through to native Ackermann, and recorded in extras for
+# the fallback backend.
+ackermann_accel_default: 1.5
+
+# Default jerk value used for ACKERMANN commands when the payload omits "jerk".
+# Passed through to native Ackermann, and recorded in extras for the fallback
+# backend.
+ackermann_jerk_default: 0.0
+
+
+# -----------------------------------------------------------------------------
+# Related runtime environment variables
+# -----------------------------------------------------------------------------
+#
+# These are not read from InitRequest.config, so they are documented here only.
+# Set them in the process/container environment instead of enabling them as YAML
+# config keys.
+#
+# CARLA_HOST=localhost    # CARLA RPC host used by the wrapper.
+# CARLA_PORT=2000         # CARLA RPC/server port.
+# CARLA_TM_PORT=8000      # TrafficManager port used by ScenarioRunner.
+# CARLA_TIMEOUT=30        # CARLA client RPC timeout in seconds.
