@@ -26,6 +26,13 @@ from pisa_api.simulator import (
     StepRequest,
 )
 
+from .lifecycle import (
+    clear_dynamic_actors,
+    destroy_actor,
+    force_async_world_for_cleanup,
+    is_dynamic_actor,
+)
+
 try:
     import carla
     import py_trees
@@ -51,6 +58,51 @@ else:
     _CARLA_IMPORT_ERROR = None
 
 logger = logging.getLogger(__name__)
+
+
+_VEHICLE_TYPE_BY_BLUEPRINT_ID = {
+    "vehicle.audi.a2": RoadObjectType.CAR,
+    "vehicle.audi.etron": RoadObjectType.CAR,
+    "vehicle.audi.tt": RoadObjectType.CAR,
+    "vehicle.bmw.grandtourer": RoadObjectType.CAR,
+    "vehicle.chevrolet.impala": RoadObjectType.CAR,
+    "vehicle.citroen.c3": RoadObjectType.CAR,
+    "vehicle.dodge.charger_2020": RoadObjectType.CAR,
+    "vehicle.dodge.charger_police": RoadObjectType.CAR,
+    "vehicle.dodge.charger_police_2020": RoadObjectType.CAR,
+    "vehicle.ford.crown": RoadObjectType.CAR,
+    "vehicle.ford.mustang": RoadObjectType.CAR,
+    "vehicle.jeep.wrangler_rubicon": RoadObjectType.CAR,
+    "vehicle.lincoln.mkz_2017": RoadObjectType.CAR,
+    "vehicle.lincoln.mkz_2020": RoadObjectType.CAR,
+    "vehicle.mercedes.coupe": RoadObjectType.CAR,
+    "vehicle.mercedes.coupe_2020": RoadObjectType.CAR,
+    "vehicle.micro.microlino": RoadObjectType.CAR,
+    "vehicle.mini.cooper_s": RoadObjectType.CAR,
+    "vehicle.mini.cooper_s_2021": RoadObjectType.CAR,
+    "vehicle.nissan.micra": RoadObjectType.CAR,
+    "vehicle.nissan.patrol": RoadObjectType.CAR,
+    "vehicle.nissan.patrol_2021": RoadObjectType.CAR,
+    "vehicle.seat.leon": RoadObjectType.CAR,
+    "vehicle.tesla.model3": RoadObjectType.CAR,
+    "vehicle.toyota.prius": RoadObjectType.CAR,
+    "vehicle.carlamotors.carlacola": RoadObjectType.TRUCK,
+    "vehicle.carlamotors.european_hgv": RoadObjectType.TRUCK,
+    "vehicle.carlamotors.firetruck": RoadObjectType.TRUCK,
+    "vehicle.tesla.cybertruck": RoadObjectType.TRUCK,
+    "vehicle.ford.ambulance": RoadObjectType.VAN,
+    "vehicle.mercedes.sprinter": RoadObjectType.VAN,
+    "vehicle.volkswagen.t2": RoadObjectType.VAN,
+    "vehicle.volkswagen.t2_2021": RoadObjectType.VAN,
+    "vehicle.mitsubishi.fusorosa": RoadObjectType.BUS,
+    "vehicle.harley-davidson.low_rider": RoadObjectType.MOTORCYCLE,
+    "vehicle.kawasaki.ninja": RoadObjectType.MOTORCYCLE,
+    "vehicle.vespa.zx125": RoadObjectType.MOTORCYCLE,
+    "vehicle.yamaha.yzf": RoadObjectType.MOTORCYCLE,
+    "vehicle.bh.crossbike": RoadObjectType.BICYCLE,
+    "vehicle.diamondback.century": RoadObjectType.BICYCLE,
+    "vehicle.gazelle.omafiets": RoadObjectType.BICYCLE,
+}
 
 
 def _clamp(value: float, min_value: float, max_value: float) -> float:
@@ -431,32 +483,12 @@ class CarlaAdapter:
         self._world.apply_settings(settings)
 
     def _force_async_world_for_cleanup(self) -> None:
-        if self._world is None:
-            return
-
-        try:
-            settings = self._world.get_settings()
-            changed = False
-            if settings.synchronous_mode:
-                settings.synchronous_mode = False
-                changed = True
-            if settings.fixed_delta_seconds is not None:
-                settings.fixed_delta_seconds = None
-                changed = True
-            if changed:
-                self._world.apply_settings(settings)
-                logger.info("Forced CARLA world to async mode for cleanup")
-        except Exception:
-            logger.exception("Failed to force CARLA world to async mode for cleanup")
-
-        client = getattr(self, "_client", None)
-        if client is None:
-            return
-        try:
-            tm_port = getattr(self, "_scenario_runner_tm_port", 8000)
-            client.get_trafficmanager(tm_port).set_synchronous_mode(False)
-        except Exception:
-            logger.exception("Failed to force TrafficManager to async mode for cleanup")
+        force_async_world_for_cleanup(
+            self._world,
+            client=getattr(self, "_client", None),
+            traffic_manager_port=getattr(self, "_scenario_runner_tm_port", 8000),
+            log=logger,
+        )
 
     def _prepare_reused_server_state(self) -> None:
         if self._client is None:
@@ -477,12 +509,12 @@ class CarlaAdapter:
         world = getattr(self, "_world", None)
         if world is not None:
             for actor_id in list(spawned_actor_ids):
-                actor = world.get_actor(actor_id)
-                if actor is not None:
-                    try:
-                        actor.destroy()
-                    except Exception:
-                        logger.exception("Failed to destroy actor %s", actor_id)
+                try:
+                    actor = world.get_actor(actor_id)
+                except Exception:
+                    logger.exception("Failed to get spawned actor %s for cleanup", actor_id)
+                    continue
+                destroy_actor(actor, log=logger, label="spawned actor")
 
         spawned_actor_ids.clear()
         self._objects_by_id.clear()
@@ -491,42 +523,16 @@ class CarlaAdapter:
         self._clear_collision_events()
 
     def _is_dynamic_actor(self, actor) -> bool:
-        type_id = getattr(actor, "type_id", "")
-        return (
-            type_id.startswith("vehicle.")
-            or type_id.startswith("walker.")
-            or type_id.startswith("controller.ai.walker")
-            or type_id.startswith("sensor.")
-        )
+        return is_dynamic_actor(actor)
 
     def _clear_dynamic_actors(self) -> None:
         logger.info("Clearing dynamic actors from CARLA world before scenario start")
-        if self._world is None:
-            return
-
-        self._force_async_world_for_cleanup()
-
-        try:
-            actors = list(self._world.get_actors())
-        except Exception:
-            logger.exception("Failed to list CARLA actors for reset cleanup")
-            return
-
-        destroyed_count = 0
-        for actor in actors:
-            if not self._is_dynamic_actor(actor):
-                continue
-            try:
-                actor.destroy()
-                destroyed_count += 1
-            except Exception:
-                logger.exception(
-                    "Failed to destroy dynamic actor %s",
-                    getattr(actor, "id", "<unknown>"),
-                )
-
-        if destroyed_count:
-            logger.info("Destroyed %s dynamic CARLA actors before reset", destroyed_count)
+        clear_dynamic_actors(
+            self._world,
+            client=getattr(self, "_client", None),
+            traffic_manager_port=getattr(self, "_scenario_runner_tm_port", 8000),
+            log=logger,
+        )
 
     def _snapshot_existing_actors(self) -> None:
         if self._world is None:
@@ -555,10 +561,7 @@ class CarlaAdapter:
             actor_id = getattr(actor, "id", None)
             if actor_id in self._pre_scenario_actor_ids:
                 continue
-            try:
-                actor.destroy()
-            except Exception:
-                logger.exception("Failed to destroy new scenario actor %s", actor_id)
+            destroy_actor(actor, log=logger, label="new scenario actor")
 
         self._pre_scenario_actor_ids = None
 
@@ -690,13 +693,7 @@ class CarlaAdapter:
 
         if self._sr_scenario is None:
             for actor in self._sr_ego_vehicles:
-                try:
-                    actor.destroy()
-                except Exception:
-                    logger.exception(
-                        "Failed to destroy partially spawned ego actor %s",
-                        getattr(actor, "id", "<unknown>"),
-                    )
+                destroy_actor(actor, log=logger, label="partially spawned ego actor")
             self._destroy_new_scenario_actors()
 
         # Clean up data provider
@@ -779,22 +776,40 @@ class CarlaAdapter:
         self._clear_ego_vehicle_control("scenario_runner_ego_control_disabled")
 
     def _actor_type(self, actor) -> RoadObjectType:
-        type_id = actor.type_id.lower()
+        type_id = getattr(actor, "type_id", "").lower()
         if type_id.startswith("walker.pedestrian"):
             return RoadObjectType.PEDESTRIAN
         if type_id.startswith("vehicle."):
-            if "bus" in type_id:
-                return RoadObjectType.BUS
-            if "truck" in type_id:
-                return RoadObjectType.TRUCK
+            known_type = _VEHICLE_TYPE_BY_BLUEPRINT_ID.get(type_id)
+            if known_type is not None:
+                return known_type
+
+            # Fallback for custom vehicle blueprints outside CARLA's catalogue.
             if "trailer" in type_id:
                 return RoadObjectType.TRAILER
-            if "motorcycle" in type_id or "motorbike" in type_id:
-                return RoadObjectType.MOTORCYCLE
-            if "bicycle" in type_id or "bike" in type_id or "diamondback" in type_id:
-                return RoadObjectType.BICYCLE
-            if "van" in type_id:
+            if "bus" in type_id:
+                return RoadObjectType.BUS
+            if "truck" in type_id or "hgv" in type_id:
+                return RoadObjectType.TRUCK
+            if "ambulance" in type_id or "sprinter" in type_id or "van" in type_id:
                 return RoadObjectType.VAN
+            if (
+                "motorcycle" in type_id
+                or "motorbike" in type_id
+                or "low_rider" in type_id
+                or "ninja" in type_id
+                or "vespa" in type_id
+                or "yzf" in type_id
+            ):
+                return RoadObjectType.MOTORCYCLE
+            if (
+                "bicycle" in type_id
+                or "bike" in type_id
+                or "crossbike" in type_id
+                or "diamondback" in type_id
+                or "gazelle" in type_id
+            ):
+                return RoadObjectType.BICYCLE
             return RoadObjectType.CAR
         return RoadObjectType.UNKNOWN
 
@@ -985,9 +1000,9 @@ class CarlaAdapter:
 
         try:
             self._spawned_actor_ids.discard(sensor.id)
-            sensor.destroy()
         except Exception:
-            logger.exception("Failed to destroy collision sensor")
+            logger.exception("Failed to untrack collision sensor")
+        destroy_actor(sensor, log=logger, label="collision sensor")
 
     def _clear_collision_events(self) -> None:
         with self._collision_lock:
