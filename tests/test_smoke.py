@@ -554,18 +554,6 @@ def test_partial_scenario_cleanup_handles_empty_initial_world() -> None:
     assert leaked_actor.destroy_calls == 1
 
 
-def test_start_scenario_runner_does_not_require_legacy_path() -> None:
-    from carla_wrapper.simulation import CarlaAdapter
-
-    calls = []
-    adapter = CarlaAdapter.__new__(CarlaAdapter)
-    adapter._start_scenario_runner_module = lambda sps, params: calls.append((sps, params))
-
-    adapter._start_scenario_runner("scenario_pack", {"k": "v"})
-
-    assert calls == [("scenario_pack", {"k": "v"})]
-
-
 def test_restore_traffic_manager_disables_sync_when_wrapper_enabled_it() -> None:
     from carla_wrapper.simulation import CarlaAdapter
 
@@ -579,6 +567,36 @@ def test_restore_traffic_manager_disables_sync_when_wrapper_enabled_it() -> None
     assert traffic_manager.sync_calls == [False]
     assert adapter._traffic_manager is None
     assert adapter._traffic_manager_sync_enabled is False
+
+
+def test_scenario_runner_cleanup_cleans_globals_even_when_not_running(monkeypatch) -> None:
+    from carla_wrapper import simulation
+
+    calls = []
+    monkeypatch.setattr(
+        simulation,
+        "CarlaDataProvider",
+        SimpleNamespace(cleanup=lambda: calls.append("data_provider_cleanup")),
+    )
+    monkeypatch.setattr(
+        simulation,
+        "py_trees",
+        SimpleNamespace(
+            blackboard=SimpleNamespace(
+                Blackboard=SimpleNamespace(_Blackboard__shared_state=_FakeSharedState(calls))
+            )
+        ),
+    )
+
+    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
+    adapter._restore_traffic_manager_settings = lambda: calls.append("restore_tm")
+    adapter._sr_scenario = None
+    adapter._sr_tree = None
+    adapter._sr_ego_vehicles = []
+
+    adapter._stop_scenario_runner_module()
+
+    assert calls == ["restore_tm", "data_provider_cleanup", "blackboard_clear"]
 
 
 def test_stop_does_not_call_carla_after_finalize() -> None:
@@ -661,6 +679,14 @@ class _FakeTrafficManager:
 
     def set_random_device_seed(self, seed):
         self.seed_calls.append(seed)
+
+
+class _FakeSharedState:
+    def __init__(self, calls):
+        self._calls = calls
+
+    def clear(self):
+        self._calls.append("blackboard_clear")
 
 
 class _FakeSettingsWorld:

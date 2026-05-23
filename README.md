@@ -48,8 +48,7 @@ Common config keys accepted by `InitRequest.config`:
   `ackermann_accel_default`, `ackermann_jerk_default`: Parameters for the
   fallback vehicle-control Ackermann backend.
 
-The legacy `scenario_runner_path` key is accepted for compatibility but is not
-required. ScenarioRunner is loaded through the container `PYTHONPATH`.
+ScenarioRunner is loaded through the container `PYTHONPATH`.
 
 ## Ports
 
