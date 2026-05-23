@@ -519,31 +519,34 @@ class CarlaAdapter:
         )
 
     def _snapshot_existing_actors(self) -> None:
-        if self._world is None:
+        world = getattr(self, "_world", None)
+        if world is None:
             self._pre_scenario_actor_ids = None
             return
 
         try:
-            self._pre_scenario_actor_ids = {actor.id for actor in self._world.get_actors()}
+            self._pre_scenario_actor_ids = {actor.id for actor in world.get_actors()}
         except Exception:
             logger.exception("Failed to snapshot CARLA actors before scenario start")
             self._pre_scenario_actor_ids = None
 
     def _destroy_new_scenario_actors(self) -> None:
-        if self._world is None or self._pre_scenario_actor_ids is None:
+        world = getattr(self, "_world", None)
+        pre_scenario_actor_ids = getattr(self, "_pre_scenario_actor_ids", None)
+        if world is None or pre_scenario_actor_ids is None:
             return
 
         self._force_async_world_for_cleanup()
 
         try:
-            actors = self._world.get_actors()
+            actors = world.get_actors()
         except Exception:
             logger.exception("Failed to list CARLA actors for partial scenario cleanup")
             return
 
         for actor in actors:
             actor_id = getattr(actor, "id", None)
-            if actor_id in self._pre_scenario_actor_ids:
+            if actor_id in pre_scenario_actor_ids:
                 continue
             destroy_actor(actor, log=logger, label="new scenario actor")
 
