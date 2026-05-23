@@ -787,9 +787,13 @@ def test_ackermann_defaults_to_vehicle_control_backend(monkeypatch) -> None:
     assert adapter._ego_vehicle.applied_control.brake == 1.0
     assert adapter._ego_vehicle.applied_control.steer == 0.5
     assert adapter._last_applied_control["backend"] == "vehicle_control"
+    assert adapter._last_applied_control["current_forward_speed"] == 4.0
+    assert adapter._last_applied_control["decelerating"] is True
 
 
-def test_ackermann_vehicle_control_backend_uses_min_throttle_from_stop(monkeypatch) -> None:
+def test_ackermann_vehicle_control_backend_uses_launch_throttle_from_stop(
+    monkeypatch,
+) -> None:
     from carla_wrapper import simulation
 
     monkeypatch.setattr(
@@ -804,7 +808,11 @@ def test_ackermann_vehicle_control_backend_uses_min_throttle_from_stop(monkeypat
     adapter._max_steer_rad = None
     adapter._last_applied_control = None
     adapter._external_control_prepared_actor_id = None
-    adapter.config = {"ackermann_speed_kp": 0.1, "ackermann_min_throttle": 0.25}
+    adapter.config = {
+        "ackermann_speed_kp": 0.1,
+        "ackermann_min_throttle": 0.25,
+        "ackermann_launch_throttle": 0.5,
+    }
 
     adapter._apply_ctrl(
         ControlCommand(
@@ -813,20 +821,157 @@ def test_ackermann_vehicle_control_backend_uses_min_throttle_from_stop(monkeypat
         )
     )
 
-    assert adapter._ego_vehicle.applied_control.throttle == 0.25
+    assert adapter._ego_vehicle.applied_control.throttle == 0.5
     assert adapter._ego_vehicle.applied_control.brake == 0.0
+    assert adapter._last_applied_control["current_forward_speed"] == 0.0
+
+
+def test_ackermann_vehicle_control_backend_uses_brake_gain(monkeypatch) -> None:
+    from carla_wrapper import simulation
+
+    monkeypatch.setattr(
+        simulation,
+        "carla",
+        SimpleNamespace(VehicleControl=_FakeVehicleControl),
+    )
+    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
+    adapter._ego_vehicle = _FakeVehicle(forward_speed=4.0)
+    adapter._scenario_runner_tm_port = 8000
+    adapter._yaw_sign = 1.0
+    adapter._max_steer_rad = None
+    adapter._last_applied_control = None
+    adapter._external_control_prepared_actor_id = None
+    adapter.config = {
+        "ackermann_brake_kp": 0.25,
+        "ackermann_min_brake": 0.15,
+        "ackermann_max_brake": 0.6,
+    }
+
+    adapter._apply_ctrl(
+        ControlCommand(
+            mode=ControlMode.ACKERMANN,
+            payload={"speed": 2.0, "steer": 0.0},
+        )
+    )
+
+    assert adapter._ego_vehicle.applied_control.throttle == 0.0
+    assert adapter._ego_vehicle.applied_control.brake == 0.5
+    assert adapter._last_applied_control["decelerating"] is True
+
+
+def test_ackermann_native_backend_uses_decel_defaults_when_slowing(monkeypatch) -> None:
+    from carla_wrapper import simulation
+
+    monkeypatch.setattr(
+        simulation,
+        "carla",
+        SimpleNamespace(
+            AckermannControllerSettings=_FakeAckermannControllerSettings,
+            VehicleAckermannControl=_FakeVehicleAckermannControl,
+        ),
+    )
+    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
+    adapter._ego_vehicle = _FakeVehicle(forward_speed=5.0)
+    adapter._scenario_runner_tm_port = 8000
+    adapter._yaw_sign = 1.0
+    adapter._max_steer_rad = None
+    adapter._last_applied_control = None
+    adapter._external_control_prepared_actor_id = None
+    adapter._native_ackermann_settings_actor_id = None
+    adapter._native_ackermann_settings_payload = None
+    adapter.config = {
+        "ackermann_use_native_control": True,
+        "ackermann_decel_default": 3.5,
+        "ackermann_brake_jerk_default": 9.0,
+    }
+
+    adapter._apply_ctrl(
+        ControlCommand(
+            mode=ControlMode.ACKERMANN,
+            payload={"speed": 1.0, "steer": 0.1},
+        )
+    )
+
+    assert adapter._ego_vehicle.applied_ackermann_control.speed == 1.0
+    assert adapter._ego_vehicle.applied_ackermann_control.acceleration == -3.5
+    assert adapter._ego_vehicle.applied_ackermann_control.jerk == 9.0
+    assert adapter._last_applied_control["backend"] == "native_ackermann"
+    assert adapter._last_applied_control["decelerating"] is True
+
+
+def test_ackermann_native_backend_applies_controller_settings_once(monkeypatch) -> None:
+    from carla_wrapper import simulation
+
+    monkeypatch.setattr(
+        simulation,
+        "carla",
+        SimpleNamespace(
+            AckermannControllerSettings=_FakeAckermannControllerSettings,
+            VehicleAckermannControl=_FakeVehicleAckermannControl,
+        ),
+    )
+    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
+    adapter._ego_vehicle = _FakeVehicle(forward_speed=1.0)
+    adapter._scenario_runner_tm_port = 8000
+    adapter._yaw_sign = 1.0
+    adapter._max_steer_rad = None
+    adapter._last_applied_control = None
+    adapter._external_control_prepared_actor_id = None
+    adapter._native_ackermann_settings_actor_id = None
+    adapter._native_ackermann_settings_payload = None
+    adapter.config = {
+        "ackermann_use_native_control": True,
+        "ackermann_native_speed_kp": 0.3,
+        "ackermann_native_speed_ki": 0.01,
+        "ackermann_native_speed_kd": 0.4,
+        "ackermann_native_accel_kp": 0.05,
+        "ackermann_native_accel_ki": 0.02,
+        "ackermann_native_accel_kd": 0.03,
+    }
+
+    ctrl = ControlCommand(
+        mode=ControlMode.ACKERMANN,
+        payload={"speed": 2.0, "steer": 0.0},
+    )
+    adapter._apply_ctrl(ctrl)
+    adapter._apply_ctrl(ctrl)
+
+    assert len(adapter._ego_vehicle.ackermann_settings_calls) == 1
+    settings = adapter._ego_vehicle.ackermann_settings_calls[0]
+    assert settings.speed_kp == 0.3
+    assert settings.speed_ki == 0.01
+    assert settings.speed_kd == 0.4
+    assert settings.accel_kp == 0.05
+    assert settings.accel_ki == 0.02
+    assert settings.accel_kd == 0.03
+    assert adapter._last_applied_control["controller_settings"] == {
+        "speed_kp": 0.3,
+        "speed_ki": 0.01,
+        "speed_kd": 0.4,
+        "accel_kp": 0.05,
+        "accel_ki": 0.02,
+        "accel_kd": 0.03,
+    }
 
 
 class _FakeVehicle:
     def __init__(self, forward_speed=0.0):
         self.id = 1
         self.applied_control = None
+        self.applied_ackermann_control = None
+        self.ackermann_settings_calls = []
         self.autopilot_calls = []
         self.simulate_physics_calls = []
         self.forward_speed = forward_speed
 
     def apply_control(self, control):
         self.applied_control = control
+
+    def apply_ackermann_control(self, control):
+        self.applied_ackermann_control = control
+
+    def apply_ackermann_controller_settings(self, settings):
+        self.ackermann_settings_calls.append(settings)
 
     def set_autopilot(self, enabled, port=None):
         self.autopilot_calls.append((enabled, port))
@@ -846,3 +991,37 @@ class _FakeVehicleControl:
         self.throttle = throttle
         self.steer = steer
         self.brake = brake
+
+
+class _FakeAckermannControllerSettings:
+    def __init__(
+        self,
+        speed_kp=0.15,
+        speed_ki=0.0,
+        speed_kd=0.25,
+        accel_kp=0.01,
+        accel_ki=0.0,
+        accel_kd=0.01,
+    ):
+        self.speed_kp = speed_kp
+        self.speed_ki = speed_ki
+        self.speed_kd = speed_kd
+        self.accel_kp = accel_kp
+        self.accel_ki = accel_ki
+        self.accel_kd = accel_kd
+
+
+class _FakeVehicleAckermannControl:
+    def __init__(
+        self,
+        steer=0.0,
+        steer_speed=0.0,
+        speed=0.0,
+        acceleration=0.0,
+        jerk=0.0,
+    ):
+        self.steer = steer
+        self.steer_speed = steer_speed
+        self.speed = speed
+        self.acceleration = acceleration
+        self.jerk = jerk

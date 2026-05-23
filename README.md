@@ -44,9 +44,17 @@ Common config keys accepted by `InitRequest.config`:
 - `scenario_runner_tm_seed`: TrafficManager random seed. Defaults to `0`.
 - `ackermann_use_native_control`: Uses CARLA native Ackermann control when
   enabled. Defaults to `false`.
-- `ackermann_speed_kp`, `ackermann_min_throttle`,
-  `ackermann_accel_default`, `ackermann_jerk_default`: Parameters for the
-  fallback vehicle-control Ackermann backend.
+- `ackermann_native_speed_kp`, `ackermann_native_speed_ki`,
+  `ackermann_native_speed_kd`, `ackermann_native_accel_kp`,
+  `ackermann_native_accel_ki`, `ackermann_native_accel_kd`,
+  `ackermann_speed_kp`, `ackermann_min_throttle`,
+  `ackermann_max_throttle`, `ackermann_stop_speed_threshold`,
+  `ackermann_launch_speed_threshold`, `ackermann_launch_target_threshold`,
+  `ackermann_launch_throttle`, `ackermann_brake_kp`,
+  `ackermann_min_brake`, `ackermann_max_brake`,
+  `ackermann_accel_default`, `ackermann_decel_default`,
+  `ackermann_jerk_default`, `ackermann_brake_jerk_default`: Parameters for
+  Ackermann native and fallback vehicle-control behavior.
 
 ScenarioRunner is loaded through the container `PYTHONPATH`.
 

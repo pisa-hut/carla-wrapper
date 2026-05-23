@@ -13,8 +13,7 @@ synchronous_mode: true
 
 # Disable rendering on the CARLA server side.
 # Use true for faster headless runs when camera/display rendering is not needed.
-no_rendering_mode: false
-
+no_rendering_mode: true
 
 # -----------------------------------------------------------------------------
 # Coordinate convention
@@ -30,18 +29,16 @@ yaw_sign: 1.0
 # offset relative to CARLA.
 yaw_offset_deg: 0.0
 
-
 # -----------------------------------------------------------------------------
 # CARLA connection retry
 # -----------------------------------------------------------------------------
 
 # Total number of seconds init() will spend retrying the CARLA connection before
 # returning InitResponse(success=false).
-carla_connect_timeout_seconds: 10
+carla_connect_timeout_seconds: 40
 
 # Seconds to sleep between CARLA connection attempts during init().
 retry_interval_seconds: 2
-
 
 # -----------------------------------------------------------------------------
 # ScenarioRunner control ownership
@@ -56,7 +53,6 @@ disable_scenario_runner_ego_control: true
 # 1 lets ScenarioRunner finish initial setup, then hands control to the wrapper.
 scenario_runner_ego_control_ticks_before_disable: 1
 
-
 # -----------------------------------------------------------------------------
 # TrafficManager
 # -----------------------------------------------------------------------------
@@ -64,7 +60,6 @@ scenario_runner_ego_control_ticks_before_disable: 1
 # Random seed passed to CARLA TrafficManager when ScenarioRunner is started.
 # Use a fixed value for reproducible traffic behavior.
 scenario_runner_tm_seed: 0
-
 
 # -----------------------------------------------------------------------------
 # Ackermann control
@@ -75,6 +70,24 @@ scenario_runner_tm_seed: 0
 # throttle, brake, and normalized steer.
 ackermann_use_native_control: false
 
+# Native CARLA Ackermann speed PID proportional gain.
+ackermann_native_speed_kp: 0.15
+
+# Native CARLA Ackermann speed PID integral gain.
+ackermann_native_speed_ki: 0.0
+
+# Native CARLA Ackermann speed PID derivative gain.
+ackermann_native_speed_kd: 0.25
+
+# Native CARLA Ackermann acceleration PID proportional gain.
+ackermann_native_accel_kp: 0.01
+
+# Native CARLA Ackermann acceleration PID integral gain.
+ackermann_native_accel_ki: 0.0
+
+# Native CARLA Ackermann acceleration PID derivative gain.
+ackermann_native_accel_kd: 0.01
+
 # Proportional gain used by the fallback VehicleControl backend to convert
 # speed error into throttle.
 ackermann_speed_kp: 0.35
@@ -83,16 +96,52 @@ ackermann_speed_kp: 0.35
 # target speed is positive and acceleration is requested.
 ackermann_min_throttle: 0.2
 
+# Maximum throttle used by the fallback VehicleControl backend.
+ackermann_max_throttle: 0.75
+
+# Current speed below this value, in m/s, is treated as zero for Ackermann
+# control decisions. This filters low-speed CARLA physics noise.
+ackermann_stop_speed_threshold: 0.05
+
+# When current speed is below this value and the target speed is high enough,
+# the fallback VehicleControl backend uses launch throttle to overcome static
+# friction and make starts less sluggish.
+ackermann_launch_speed_threshold: 0.3
+
+# Minimum target speed, in m/s, required to use launch throttle.
+ackermann_launch_target_threshold: 0.5
+
+# Throttle used during fallback VehicleControl launch from near stop.
+ackermann_launch_throttle: 0.45
+
+# Proportional gain used by the fallback VehicleControl backend to convert
+# overspeed into brake.
+ackermann_brake_kp: 0.6
+
+# Minimum non-zero brake used by the fallback VehicleControl backend while
+# decelerating.
+ackermann_min_brake: 0.15
+
+# Maximum brake used by the fallback VehicleControl backend while decelerating.
+ackermann_max_brake: 0.8
+
 # Default acceleration value used for ACKERMANN commands when the payload omits
-# "acceleration". Passed through to native Ackermann, and recorded in extras for
-# the fallback backend.
+# "acceleration" and the target speed is not below current speed. Passed through
+# to native Ackermann, and recorded in extras for the fallback backend.
 ackermann_accel_default: 1.5
 
+# Default deceleration magnitude, in m/s^2, used by native Ackermann when the
+# payload omits "acceleration" and the target speed is below current speed. The
+# wrapper sends this as a negative acceleration.
+ackermann_decel_default: 4.0
+
 # Default jerk value used for ACKERMANN commands when the payload omits "jerk".
-# Passed through to native Ackermann, and recorded in extras for the fallback
-# backend.
+# Used when the target speed is not below current speed.
 ackermann_jerk_default: 0.0
 
+# Default jerk used by native Ackermann when the payload omits "jerk" and the
+# target speed is below current speed.
+ackermann_brake_jerk_default: 8.0
 
 # -----------------------------------------------------------------------------
 # Related runtime environment variables

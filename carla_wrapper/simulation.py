@@ -181,6 +181,8 @@ class CarlaAdapter:
         self._max_steer_rad: float | None = None
         self._last_applied_control = None
         self._external_control_prepared_actor_id = None
+        self._native_ackermann_settings_actor_id = None
+        self._native_ackermann_settings_payload = None
         self._quit_flag = False
 
         self._spawned_actor_ids: set[int] = set()
@@ -839,19 +841,84 @@ class CarlaAdapter:
             return _clamp(steer_rad / self._max_steer_rad, -1.0, 1.0)
         return _clamp(steer_rad, -1.0, 1.0)
 
-    def _ackermann_speed_to_vehicle_control(self, target_speed: float) -> tuple[float, float]:
+    def _ackermann_current_speed(self) -> float:
         current_speed = self._get_forward_speed(self._ego_vehicle)
-        speed_error = target_speed - current_speed
-        if target_speed <= 0.0 and current_speed > 0.05:
-            return 0.0, 1.0
+        stop_threshold = float(self.config.get("ackermann_stop_speed_threshold", 0.05))
+        if abs(current_speed) < stop_threshold:
+            return 0.0
+        return current_speed
 
-        kp = float(self.config.get("ackermann_speed_kp", 0.35))
-        if speed_error >= 0.0:
-            throttle = _clamp(speed_error * kp, 0.0, 1.0)
-            if target_speed > 0.05 and throttle > 0.0:
-                throttle = max(throttle, float(self.config.get("ackermann_min_throttle", 0.2)))
-            return throttle, 0.0
-        return 0.0, _clamp(-speed_error * kp, 0.0, 1.0)
+    def _ackermann_speed_to_vehicle_control(
+        self, target_speed: float
+    ) -> tuple[float, float, float]:
+        current_speed = self._ackermann_current_speed()
+        stop_threshold = float(self.config.get("ackermann_stop_speed_threshold", 0.05))
+        speed_error = target_speed - current_speed
+        if target_speed <= stop_threshold and current_speed > stop_threshold:
+            return 0.0, 1.0, current_speed
+
+        if speed_error > 0.0:
+            kp = float(self.config.get("ackermann_speed_kp", 0.35))
+            min_throttle = float(self.config.get("ackermann_min_throttle", 0.2))
+            max_throttle = float(self.config.get("ackermann_max_throttle", 0.75))
+            launch_speed_threshold = float(self.config.get("ackermann_launch_speed_threshold", 0.3))
+            launch_target_threshold = float(
+                self.config.get("ackermann_launch_target_threshold", 0.5)
+            )
+            launch_throttle = float(self.config.get("ackermann_launch_throttle", 0.45))
+
+            throttle = speed_error * kp
+            if (
+                target_speed >= launch_target_threshold
+                and abs(current_speed) <= launch_speed_threshold
+            ):
+                throttle = max(throttle, launch_throttle)
+            elif target_speed > stop_threshold:
+                throttle = max(throttle, min_throttle)
+            return _clamp(throttle, 0.0, max_throttle), 0.0, current_speed
+
+        if speed_error < 0.0:
+            brake_kp = float(self.config.get("ackermann_brake_kp", 0.6))
+            min_brake = float(self.config.get("ackermann_min_brake", 0.15))
+            max_brake = float(self.config.get("ackermann_max_brake", 0.8))
+
+            brake = max(-speed_error * brake_kp, min_brake)
+            return 0.0, _clamp(brake, 0.0, max_brake), current_speed
+
+        return 0.0, 0.0, current_speed
+
+    def _ackermann_controller_settings_payload(self) -> dict[str, float]:
+        return {
+            "speed_kp": float(self.config.get("ackermann_native_speed_kp", 0.15)),
+            "speed_ki": float(self.config.get("ackermann_native_speed_ki", 0.0)),
+            "speed_kd": float(self.config.get("ackermann_native_speed_kd", 0.25)),
+            "accel_kp": float(self.config.get("ackermann_native_accel_kp", 0.01)),
+            "accel_ki": float(self.config.get("ackermann_native_accel_ki", 0.0)),
+            "accel_kd": float(self.config.get("ackermann_native_accel_kd", 0.01)),
+        }
+
+    def _apply_native_ackermann_controller_settings(self) -> dict[str, float]:
+        settings_payload = self._ackermann_controller_settings_payload()
+        actor_id = getattr(self._ego_vehicle, "id", None)
+        settings_key = tuple(settings_payload.items())
+        if (
+            actor_id == self._native_ackermann_settings_actor_id
+            and settings_key == self._native_ackermann_settings_payload
+        ):
+            return settings_payload
+
+        if not hasattr(self._ego_vehicle, "apply_ackermann_controller_settings"):
+            logger.warning("Ego vehicle does not support Ackermann controller settings")
+            return settings_payload
+        if not hasattr(carla, "AckermannControllerSettings"):
+            logger.warning("CARLA API does not provide AckermannControllerSettings")
+            return settings_payload
+
+        settings = carla.AckermannControllerSettings(**settings_payload)
+        self._ego_vehicle.apply_ackermann_controller_settings(settings)
+        self._native_ackermann_settings_actor_id = actor_id
+        self._native_ackermann_settings_payload = settings_key
+        return settings_payload
 
     def _collect_runtime_frame(self) -> RuntimeFrameData:
         objects, sim_time_ns, carla_frame = self._collect_objects()
@@ -1144,24 +1211,39 @@ class CarlaAdapter:
                 if "speed" in payload
                 else self._get_forward_speed(self._ego_vehicle)
             )
+            target_speed = max(speed, 0.0)
+            current_forward_speed = self._ackermann_current_speed()
+            print(
+                f"Current forward speed: {current_forward_speed:.2f} m/s, Target speed: {target_speed:.2f} m/s"
+            )
+            stop_threshold = float(self.config.get("ackermann_stop_speed_threshold", 0.05))
+            decelerating = target_speed < current_forward_speed - stop_threshold
+
             acceleration = payload.get("acceleration", None)
             if acceleration is None:
-                acceleration = float(self.config.get("ackermann_accel_default", 1.5))
+                if decelerating:
+                    acceleration = -float(self.config.get("ackermann_decel_default", 4.0))
+                else:
+                    acceleration = float(self.config.get("ackermann_accel_default", 1.5))
             else:
                 acceleration = float(acceleration)
             jerk = payload.get("jerk", None)
             if jerk is None:
-                jerk = float(self.config.get("ackermann_jerk_default", 0.0))
+                if decelerating:
+                    jerk = float(self.config.get("ackermann_brake_jerk_default", 8.0))
+                else:
+                    jerk = float(self.config.get("ackermann_jerk_default", 0.0))
             else:
                 jerk = float(jerk)
 
             if self._max_steer_rad:
                 steer = _clamp(steer, -self._max_steer_rad, self._max_steer_rad)
             if bool(self.config.get("ackermann_use_native_control", False)):
+                controller_settings = self._apply_native_ackermann_controller_settings()
                 control = carla.VehicleAckermannControl(
                     steer=steer,
                     steer_speed=steer_speed,
-                    speed=speed,
+                    speed=target_speed,
                     acceleration=acceleration,
                     jerk=jerk,
                 )
@@ -1172,12 +1254,17 @@ class CarlaAdapter:
                     "backend": "native_ackermann",
                     "steer": steer,
                     "steer_speed": steer_speed,
-                    "speed": speed,
+                    "target_speed": target_speed,
+                    "current_forward_speed": current_forward_speed,
                     "acceleration": acceleration,
                     "jerk": jerk,
+                    "decelerating": decelerating,
+                    "controller_settings": controller_settings,
                 }
             else:
-                throttle, brake = self._ackermann_speed_to_vehicle_control(max(speed, 0.0))
+                throttle, brake, current_forward_speed = self._ackermann_speed_to_vehicle_control(
+                    target_speed
+                )
                 vehicle_steer = self._ackermann_steer_to_vehicle_control(steer)
                 control = carla.VehicleControl(
                     throttle=throttle,
@@ -1191,9 +1278,11 @@ class CarlaAdapter:
                     "throttle": throttle,
                     "brake": brake,
                     "steer": vehicle_steer,
-                    "target_speed": max(speed, 0.0),
+                    "target_speed": target_speed,
+                    "current_forward_speed": current_forward_speed,
                     "acceleration": acceleration,
                     "jerk": jerk,
+                    "decelerating": decelerating,
                 }
 
             self._last_applied_control = {
