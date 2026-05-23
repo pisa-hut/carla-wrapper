@@ -1213,9 +1213,6 @@ class CarlaAdapter:
             )
             target_speed = max(speed, 0.0)
             current_forward_speed = self._ackermann_current_speed()
-            print(
-                f"Current forward speed: {current_forward_speed:.2f} m/s, Target speed: {target_speed:.2f} m/s"
-            )
             stop_threshold = float(self.config.get("ackermann_stop_speed_threshold", 0.05))
             decelerating = target_speed < current_forward_speed - stop_threshold
 
