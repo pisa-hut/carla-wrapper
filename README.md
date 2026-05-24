@@ -42,6 +42,12 @@ Common config keys accepted by `InitRequest.config`:
 - `scenario_runner_ego_control_ticks_before_disable`: Number of ScenarioRunner
   ticks before disabling its ego controller. Defaults to `1`.
 - `scenario_runner_tm_seed`: TrafficManager random seed. Defaults to `0`.
+- `kinematic_speed_deadband_mps`,
+  `kinematic_acceleration_deadband_mps2`,
+  `kinematic_yaw_rate_deadband_radps`,
+  `kinematic_yaw_acceleration_deadband_radps2`: Clamp near-zero output
+  kinematic values to `0.0` before publishing runtime objects. Defaults to
+  `0.0`, which disables each deadband unless configured.
 - `ackermann_use_native_control`: Uses CARLA native Ackermann control when
   enabled. Defaults to `false`.
 - `ackermann_native_speed_kp`, `ackermann_native_speed_ki`,

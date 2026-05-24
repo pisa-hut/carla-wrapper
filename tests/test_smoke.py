@@ -71,10 +71,8 @@ def test_disable_scenario_runner_ego_control_removes_only_ego(monkeypatch) -> No
     assert blackboard.actor_dict == {2: target_controller}
     assert ego_controller.reset_calls == 1
     assert target_controller.reset_calls == 0
-    assert adapter._ego_vehicle.applied_control.throttle == 0.0
-    assert adapter._ego_vehicle.applied_control.brake == 0.0
-    assert adapter._ego_vehicle.applied_control.steer == 0.0
-    assert adapter._last_applied_control["mode"] == "CLEAR_EGO_CONTROL"
+    assert adapter._ego_vehicle.applied_control is None
+    assert adapter._last_applied_control is None
 
 
 def test_scenario_runner_ego_control_is_disabled_after_configured_ticks(monkeypatch) -> None:
@@ -899,6 +897,80 @@ def test_ackermann_native_backend_uses_decel_defaults_when_slowing(monkeypatch) 
     assert adapter._last_applied_control["decelerating"] is True
 
 
+def test_native_ackermann_handoff_does_not_apply_raw_vehicle_control(monkeypatch) -> None:
+    from carla_wrapper import simulation
+
+    monkeypatch.setattr(
+        simulation,
+        "carla",
+        SimpleNamespace(
+            AckermannControllerSettings=_FakeAckermannControllerSettings,
+            VehicleAckermannControl=_FakeVehicleAckermannControl,
+        ),
+    )
+    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
+    adapter._ego_vehicle = _FakeVehicle(forward_speed=1.0)
+    adapter._scenario_runner_tm_port = 8000
+    adapter._yaw_sign = 1.0
+    adapter._max_steer_rad = None
+    adapter._last_applied_control = None
+    adapter._external_control_prepared_actor_id = None
+    adapter._disable_sr_ego_control = False
+    adapter._native_ackermann_settings_actor_id = None
+    adapter._native_ackermann_settings_payload = None
+    adapter.config = {"ackermann_use_native_control": True}
+
+    adapter._apply_ctrl(
+        ControlCommand(
+            mode=ControlMode.ACKERMANN,
+            payload={"speed": 2.0, "steer": 0.0},
+        )
+    )
+
+    assert adapter._ego_vehicle.applied_control is None
+    assert adapter._ego_vehicle.applied_ackermann_control.speed == 2.0
+
+
+def test_kinematic_deadbands_clamp_near_zero_values() -> None:
+    from carla_wrapper import simulation
+
+    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
+    adapter.config = {
+        "kinematic_speed_deadband_mps": 0.02,
+        "kinematic_acceleration_deadband_mps2": 0.15,
+        "kinematic_yaw_rate_deadband_radps": 0.003,
+        "kinematic_yaw_acceleration_deadband_radps2": 0.1,
+    }
+
+    assert adapter._apply_kinematic_deadbands(
+        speed=0.01,
+        acceleration=-0.12,
+        yaw_rate=0.002,
+        yaw_acceleration=-0.08,
+    ) == (0.0, 0.0, 0.0, 0.0)
+
+    assert adapter._apply_kinematic_deadbands(
+        speed=0.03,
+        acceleration=-0.2,
+        yaw_rate=0.004,
+        yaw_acceleration=-0.2,
+    ) == (0.03, -0.2, 0.004, -0.2)
+
+
+def test_kinematic_deadbands_default_to_disabled() -> None:
+    from carla_wrapper import simulation
+
+    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
+    adapter.config = {}
+
+    assert adapter._apply_kinematic_deadbands(
+        speed=0.01,
+        acceleration=-0.12,
+        yaw_rate=0.002,
+        yaw_acceleration=-0.08,
+    ) == (0.01, -0.12, 0.002, -0.08)
+
+
 def test_ackermann_native_backend_applies_controller_settings_once(monkeypatch) -> None:
     from carla_wrapper import simulation
 
@@ -966,6 +1038,9 @@ class _FakeVehicle:
 
     def apply_control(self, control):
         self.applied_control = control
+
+    def get_control(self):
+        return self.applied_control or _FakeVehicleControl()
 
     def apply_ackermann_control(self, control):
         self.applied_ackermann_control = control

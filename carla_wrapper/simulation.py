@@ -261,8 +261,7 @@ class CarlaAdapter:
             self._world.tick()
         else:
             self._world.wait_for_tick()
-        frame = self._collect_runtime_frame()
-        return frame
+        return self._collect_runtime_frame()
 
     def stop(self) -> None:
         self._finalize()
@@ -314,6 +313,7 @@ class CarlaAdapter:
         actor_id = int(self._ego_vehicle.id) if hasattr(self._ego_vehicle, "id") else None
         if actor_id is not None and actor_id == self._external_control_prepared_actor_id:
             return
+        self._disable_scenario_runner_ego_control()
         if hasattr(self._ego_vehicle, "set_autopilot"):
             try:
                 self._ego_vehicle.set_autopilot(False, self._scenario_runner_tm_port)
@@ -328,29 +328,6 @@ class CarlaAdapter:
                 logger.exception("Failed to enable ego vehicle physics")
 
         self._external_control_prepared_actor_id = actor_id
-
-    def _clear_ego_vehicle_control(self, reason: str) -> None:
-        if self._ego_vehicle is None or carla is None:
-            return
-        if not hasattr(self._ego_vehicle, "apply_control"):
-            return
-        if not hasattr(carla, "VehicleControl"):
-            return
-
-        control = carla.VehicleControl(throttle=0.0, steer=0.0, brake=0.0)
-        try:
-            self._ego_vehicle.apply_control(control)
-        except Exception:
-            logger.exception("Failed to clear ego vehicle control after %s", reason)
-            return
-
-        self._last_applied_control = {
-            "mode": "CLEAR_EGO_CONTROL",
-            "reason": reason,
-            "throttle": 0.0,
-            "brake": 0.0,
-            "steer": 0.0,
-        }
 
     def _ensure_connected(self) -> bool:
         timeout = self.config.get("carla_connect_timeout_seconds", 10)
@@ -595,6 +572,8 @@ class CarlaAdapter:
             ego_vehicles.append(actor)
             self._sr_ego_vehicles = ego_vehicles
         logger.debug("Spawned %s ego vehicles for scenario", len(ego_vehicles))
+        if not ego_vehicles:
+            raise RuntimeError("OpenSCENARIO did not define any ego vehicles")
 
         scenario = OpenScenario(
             world=self._world,
@@ -751,7 +730,7 @@ class CarlaAdapter:
             self._quit_flag = True
 
     def _disable_scenario_runner_ego_control(self) -> None:
-        if not self._disable_sr_ego_control:
+        if not getattr(self, "_disable_sr_ego_control", True):
             return
         if self._ego_vehicle is None or py_trees is None:
             return
@@ -771,7 +750,6 @@ class CarlaAdapter:
         except Exception:
             logger.exception("Failed to reset ScenarioRunner ego controller")
         py_trees.blackboard.Blackboard().set("ActorsWithController", actor_dict, overwrite=True)
-        self._clear_ego_vehicle_control("scenario_runner_ego_control_disabled")
 
     def _actor_type(self, actor) -> RoadObjectType:
         type_id = getattr(actor, "type_id", "").lower()
@@ -835,6 +813,30 @@ class CarlaAdapter:
         acc = actor.get_acceleration()
         fwd = actor.get_transform().get_forward_vector()
         return float(acc.x * fwd.x + acc.y * fwd.y + acc.z * fwd.z)
+
+    def _deadband_value(self, value: float, config_key: str) -> float:
+        threshold = abs(float((self.config or {}).get(config_key, 0.0)))
+        if threshold > 0.0 and abs(value) <= threshold:
+            return 0.0
+        return value
+
+    def _apply_kinematic_deadbands(
+        self,
+        *,
+        speed: float,
+        acceleration: float,
+        yaw_rate: float,
+        yaw_acceleration: float,
+    ) -> tuple[float, float, float, float]:
+        return (
+            self._deadband_value(speed, "kinematic_speed_deadband_mps"),
+            self._deadband_value(acceleration, "kinematic_acceleration_deadband_mps2"),
+            self._deadband_value(yaw_rate, "kinematic_yaw_rate_deadband_radps"),
+            self._deadband_value(
+                yaw_acceleration,
+                "kinematic_yaw_acceleration_deadband_radps2",
+            ),
+        )
 
     def _ackermann_steer_to_vehicle_control(self, steer_rad: float) -> float:
         if self._max_steer_rad:
@@ -983,6 +985,12 @@ class CarlaAdapter:
                 dt_s = (sim_time_ns - self._time_ns) / 1e9
             yaw_acc = (yaw_rate - prev_rate) / dt_s if dt_s > 0 else 0.0
             self._prev_yaw_rate[actor.id] = yaw_rate
+            speed, accel, yaw_rate, yaw_acc = self._apply_kinematic_deadbands(
+                speed=speed,
+                acceleration=accel,
+                yaw_rate=yaw_rate,
+                yaw_acceleration=yaw_acc,
+            )
 
             kin = ObjectKinematicData(
                 time_ns=sim_time_ns,
