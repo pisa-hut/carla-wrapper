@@ -133,13 +133,13 @@ class CarlaAdapter:
         self._external_control_prepared_actor_id: int | None = None
         self._disable_sr_ego_control = True
         self._sr_ego_control_ticks = 0
-        self._sr_ego_control_ticks_before_disable = 1
         self._quit_flag = False
         self._spawned_actor_ids: set[int] = set()
         self._sr_scenario = None
         self._sr_tree = None
         self._sr_running = False
         self._sr_ego_vehicles: list = []
+        self._sr_last_tick_timestamp = None
         self._traffic_manager = None
         self._traffic_manager_sync_enabled = False
         self._pre_scenario_actor_ids: set[int] | None = None
@@ -190,9 +190,6 @@ class CarlaAdapter:
             self.config.get("disable_scenario_runner_ego_control", True)
         )
         self._sr_ego_control_ticks = 0
-        self._sr_ego_control_ticks_before_disable = int(
-            self.config.get("scenario_runner_ego_control_ticks_before_disable", 1)
-        )
 
         self._scenario_runner_tm_port = int(os.environ.get("CARLA_TM_PORT", 8000))
         self._scenario_runner_tm_seed = int(self.config.get("scenario_runner_tm_seed", 0))
@@ -201,10 +198,10 @@ class CarlaAdapter:
         self._sr_tree = None
         self._sr_running = False
         self._sr_ego_vehicles: list = []
+        self._sr_last_tick_timestamp = None
         self._traffic_manager = None
         self._traffic_manager_sync_enabled = False
         self._pre_scenario_actor_ids = None
-
         self._prepare_reused_server_state()
 
         return InitResponse(success=True)
@@ -221,6 +218,9 @@ class CarlaAdapter:
             self._quit_flag = False
             self._clear_collision_events()
             self._pre_scenario_actor_ids = None
+            self._sr_ego_control_ticks = 0
+            self._sr_last_tick_timestamp = None
+            self._external_control_prepared_actor_id = None
 
             scenario_format = self.scenario.format
             use_scenario_runner_world_loading = scenario_format == "open_scenario1"
@@ -232,10 +232,10 @@ class CarlaAdapter:
             if not use_scenario_runner_world_loading:
                 self._apply_world_settings()
 
-            p = str((self._output_dir / "carla_recording.log").resolve())
-            self._client.start_recorder(p)
             logger.info("Starting ScenarioRunner...")
             self._start_scenario_runner(request.scenario_pack, request.params)
+            p = str((self._output_dir / "carla_recording.log").resolve())
+            self._client.start_recorder(p)
 
             if self._ego_vehicle is None:
                 logger.warning("Ego vehicle not found after starting ScenarioRunner")
@@ -432,6 +432,46 @@ class CarlaAdapter:
         self._world = world
         CarlaDataProvider.set_world(world)
 
+    def _load_and_wait_for_scenario_runner_world(self, config=None) -> None:
+        if self._client is None:
+            raise RuntimeError("CARLA client is not available")
+
+        try:
+            world = self._client.get_world()
+        except Exception:
+            logger.exception("Failed to get CARLA world after ScenarioRunner configuration")
+            world = None
+
+        if world is None:
+            try:
+                world = CarlaDataProvider.get_world()
+            except Exception:
+                logger.exception("Failed to read CARLA world from CarlaDataProvider")
+
+        if world is None:
+            raise RuntimeError("CARLA world is not available after ScenarioRunner setup")
+
+        self._world = world
+        self._apply_world_settings()
+        CarlaDataProvider.set_client(self._client)
+        CarlaDataProvider.set_world(world)
+
+        if self._sync:
+            world.tick()
+        else:
+            world.wait_for_tick()
+        self._sr_last_tick_timestamp = None
+
+        town = getattr(config, "town", None)
+        get_map = getattr(CarlaDataProvider, "get_map", None)
+        if town and get_map is not None:
+            map_name = get_map().name.split("/")[-1]
+            town_name = Path(str(town)).name
+            if map_name not in (str(town), town_name, "OpenDriveMap"):
+                raise RuntimeError(
+                    f"CARLA server uses map '{map_name}', but scenario requires '{town}'"
+                )
+
     def _apply_world_settings(self) -> None:
         if self._world is None:
             return
@@ -551,8 +591,7 @@ class CarlaAdapter:
             raise RuntimeError(f"OpenSCENARIO file not found: {xosc_path}")
 
         config = OpenScenarioConfiguration(str(xosc_path), self._client, openscenario_params)
-        self._sync_world_from_scenario_runner()
-        self._apply_world_settings()
+        self._load_and_wait_for_scenario_runner_world(config)
         CarlaDataProvider.set_world(self._world)
         return config, xosc_path
 
@@ -595,18 +634,11 @@ class CarlaAdapter:
         if self._client is None or self._world is None:
             raise RuntimeError("CARLA client/world not available")
 
-        self._snapshot_existing_actors()
+        self._sr_ego_control_ticks = 0
+        self._sr_last_tick_timestamp = None
+        self._external_control_prepared_actor_id = None
 
         CarlaDataProvider.set_client(self._client)
-        CarlaDataProvider.set_world(self._world)
-        CarlaDataProvider.set_traffic_manager_port(self._scenario_runner_tm_port)
-        tm = self._client.get_trafficmanager(self._scenario_runner_tm_port)
-        self._traffic_manager = tm
-        self._traffic_manager_sync_enabled = False
-        tm.set_random_device_seed(self._scenario_runner_tm_seed)
-        if self._sync:
-            tm.set_synchronous_mode(True)
-            self._traffic_manager_sync_enabled = True
 
         match self.scenario.format:
             case "open_scenario1":
@@ -623,6 +655,17 @@ class CarlaAdapter:
 
             case _:
                 raise RuntimeError(f"Unsupported scenario format: {self.scenario.format}")
+
+        CarlaDataProvider.set_traffic_manager_port(self._scenario_runner_tm_port)
+        tm = self._client.get_trafficmanager(self._scenario_runner_tm_port)
+        self._traffic_manager = tm
+        self._traffic_manager_sync_enabled = False
+        tm.set_random_device_seed(self._scenario_runner_tm_seed)
+        if self._sync:
+            tm.set_synchronous_mode(True)
+            self._traffic_manager_sync_enabled = True
+
+        self._snapshot_existing_actors()
 
         match self.scenario.format:
             case "open_scenario1":
@@ -689,6 +732,7 @@ class CarlaAdapter:
         self._sr_tree = None
         self._sr_running = False
         self._sr_ego_vehicles = []
+        self._sr_last_tick_timestamp = None
         logger.info("ScenarioRunner cleanup complete")
 
     def _restore_traffic_manager_settings(self) -> None:
@@ -717,13 +761,20 @@ class CarlaAdapter:
         if self._sr_tree is None or not self._sr_running:
             return
 
-        if self._sr_ego_control_ticks_before_disable <= 0:
-            self._disable_scenario_runner_ego_control()
+        timestamp_key = (
+            getattr(timestamp, "frame", None),
+            getattr(timestamp, "elapsed_seconds", None),
+        )
+        if timestamp_key != (None, None):
+            if timestamp_key == getattr(self, "_sr_last_tick_timestamp", None):
+                return
+            self._sr_last_tick_timestamp = timestamp_key
+
         GameTime.on_carla_tick(timestamp)
         CarlaDataProvider.on_carla_tick()
         self._sr_tree.tick_once()
         self._sr_ego_control_ticks += 1
-        if self._sr_ego_control_ticks >= self._sr_ego_control_ticks_before_disable:
+        if self._sr_ego_control_ticks >= 1:
             self._disable_scenario_runner_ego_control()
         if self._sr_tree.status != py_trees.common.Status.RUNNING:
             self._sr_running = False

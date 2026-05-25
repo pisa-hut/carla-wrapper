@@ -75,7 +75,7 @@ def test_disable_scenario_runner_ego_control_removes_only_ego(monkeypatch) -> No
     assert adapter._last_applied_control is None
 
 
-def test_scenario_runner_ego_control_is_disabled_after_configured_ticks(monkeypatch) -> None:
+def test_scenario_runner_ego_control_is_disabled_after_first_tick(monkeypatch) -> None:
     from carla_wrapper import simulation
 
     calls = []
@@ -108,7 +108,6 @@ def test_scenario_runner_ego_control_is_disabled_after_configured_ticks(monkeypa
     adapter._ego_vehicle = SimpleNamespace(id=1)
     adapter._disable_sr_ego_control = True
     adapter._sr_ego_control_ticks = 0
-    adapter._sr_ego_control_ticks_before_disable = 1
     adapter._quit_flag = False
 
     adapter._tick_scenario_runner_module()
@@ -116,6 +115,44 @@ def test_scenario_runner_ego_control_is_disabled_after_configured_ticks(monkeypa
     assert calls == ["game_time", "data_provider", "tree_tick"]
     assert blackboard.actor_dict == {}
     assert ego_controller.reset_calls == 1
+
+
+def test_scenario_runner_tree_ticks_once_per_world_timestamp(monkeypatch) -> None:
+    from carla_wrapper import simulation
+
+    calls = []
+    monkeypatch.setattr(
+        simulation,
+        "py_trees",
+        SimpleNamespace(common=SimpleNamespace(Status=SimpleNamespace(RUNNING="RUNNING"))),
+    )
+    monkeypatch.setattr(
+        simulation,
+        "GameTime",
+        SimpleNamespace(on_carla_tick=lambda timestamp: calls.append("game_time")),
+    )
+    monkeypatch.setattr(
+        simulation,
+        "CarlaDataProvider",
+        SimpleNamespace(on_carla_tick=lambda: calls.append("data_provider")),
+    )
+
+    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
+    adapter._world = _FakeScenarioWorld()
+    adapter._sr_scenario = object()
+    adapter._sr_running = True
+    adapter._sr_tree = _FakeScenarioTree(calls)
+    adapter._ego_vehicle = SimpleNamespace(id=1)
+    adapter._disable_sr_ego_control = False
+    adapter._sr_ego_control_ticks = 0
+    adapter._sr_last_tick_timestamp = None
+    adapter._quit_flag = False
+
+    adapter._tick_scenario_runner_module()
+    adapter._tick_scenario_runner_module()
+
+    assert calls == ["game_time", "data_provider", "tree_tick"]
+    assert adapter._sr_ego_control_ticks == 1
 
 
 def test_finalize_destroys_collision_sensor_before_scenario_runner_cleanup() -> None:
@@ -213,6 +250,8 @@ def test_reset_finalizes_partial_state_on_failure(tmp_path) -> None:
     adapter._finalized = True
     adapter._output_base = tmp_path
     adapter.scenario = SimpleNamespace(format="carla_lb_route")
+    adapter._sr_ego_control_ticks = 99
+    adapter._external_control_prepared_actor_id = 123
     adapter._clear_collision_events = lambda: calls.append("clear_collision_events")
     adapter._ensure_world = lambda scenario_pack, generate_opendrive_world=True: calls.append(
         ("ensure_world", scenario_pack, generate_opendrive_world)
@@ -220,9 +259,12 @@ def test_reset_finalizes_partial_state_on_failure(tmp_path) -> None:
     adapter._clear_dynamic_actors = lambda: calls.append("clear_dynamic_actors")
     adapter._apply_world_settings = lambda: calls.append("apply_world_settings")
     adapter._client = SimpleNamespace(start_recorder=lambda path: calls.append(("recorder", path)))
-    adapter._start_scenario_runner = lambda scenario_pack, params: (_ for _ in ()).throw(
-        RuntimeError("scenario failed")
-    )
+    def start_scenario_runner(scenario_pack, params):
+        assert adapter._sr_ego_control_ticks == 0
+        assert adapter._external_control_prepared_actor_id is None
+        raise RuntimeError("scenario failed")
+
+    adapter._start_scenario_runner = start_scenario_runner
     adapter._finalize = lambda: calls.append("finalize")
 
     request = SimpleNamespace(output_dir="run", scenario_pack=object(), params={})
@@ -265,6 +307,8 @@ def test_open_scenario_reset_delegates_world_loading_to_scenario_runner(tmp_path
 
     assert ("ensure_world", False) in calls
     assert "apply_world_settings" not in calls
+    assert calls.index("start_scenario_runner") < calls.index("start_recorder")
+    assert calls.index("start_recorder") < calls.index("tick_scenario_runner")
 
 
 def test_ensure_world_can_skip_opendrive_generation() -> None:
@@ -360,7 +404,7 @@ def test_open_scenario_uses_scenario_runner_reloaded_world(monkeypatch) -> None:
 
         @staticmethod
         def request_new_actor(*args, **kwargs):
-            calls.append(("request_new_actor", FakeDataProvider.current_world))
+            calls.append(("request_new_actor", FakeDataProvider.current_world, kwargs.get("tick")))
             return actor
 
     class FakeOpenScenarioConfiguration:
@@ -393,7 +437,10 @@ def test_open_scenario_uses_scenario_runner_reloaded_world(monkeypatch) -> None:
     monkeypatch.setattr(simulation.Path, "exists", lambda self: True)
 
     adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
-    adapter._client = SimpleNamespace(get_trafficmanager=lambda port: _FakeTrafficManager())
+    adapter._client = SimpleNamespace(
+        get_world=lambda: new_world,
+        get_trafficmanager=lambda port: _FakeTrafficManager(),
+    )
     adapter._world = old_world
     adapter._scenario_runner_tm_port = 8000
     adapter._scenario_runner_tm_seed = 0
@@ -409,8 +456,10 @@ def test_open_scenario_uses_scenario_runner_reloaded_world(monkeypatch) -> None:
 
     assert adapter._world is new_world
     assert adapter._ego_vehicle is actor
-    assert ("request_new_actor", new_world) in calls
+    assert ("request_new_actor", new_world, None) in calls
     assert ("open_scenario", new_world, True) in calls
+    assert new_world.tick_calls == 1
+    assert old_world.tick_calls == 0
     set_world_calls = [call for call in calls if call[0] == "set_world"]
     assert set_world_calls[-1] == ("set_world", new_world, True)
 
@@ -659,6 +708,8 @@ class _FakeSettingsWorld:
         )
         self.applied_settings = None
         self.actors = list(actors or [])
+        self.tick_calls = 0
+        self.wait_for_tick_calls = 0
 
     def get_settings(self):
         return self.settings
@@ -668,6 +719,12 @@ class _FakeSettingsWorld:
 
     def get_actors(self):
         return list(self.actors)
+
+    def tick(self):
+        self.tick_calls += 1
+
+    def wait_for_tick(self):
+        self.wait_for_tick_calls += 1
 
 
 class _FakeActor:

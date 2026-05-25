@@ -49,10 +49,6 @@ retry_interval_seconds: 2
 # writing ego control in the same tick.
 disable_scenario_runner_ego_control: true
 
-# Number of ScenarioRunner ticks to allow before removing its ego controller.
-# 1 lets ScenarioRunner finish initial setup, then hands control to the wrapper.
-scenario_runner_ego_control_ticks_before_disable: 1
-
 # -----------------------------------------------------------------------------
 # TrafficManager
 # -----------------------------------------------------------------------------
