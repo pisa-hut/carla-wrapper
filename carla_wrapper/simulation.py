@@ -281,6 +281,7 @@ class CarlaAdapter:
 
         self._destroy_spawned_actors()
         self._stop_scenario_runner_module()
+        self._clear_dynamic_actors()
 
         self._finalized = True
         logger.info("CARLA service finalized.")
@@ -529,7 +530,7 @@ class CarlaAdapter:
         return is_dynamic_actor(actor)
 
     def _clear_dynamic_actors(self) -> None:
-        logger.info("Clearing dynamic actors from CARLA world before scenario start")
+        logger.info("Clearing dynamic actors from CARLA world")
         clear_dynamic_actors(
             self._world,
             client=getattr(self, "_client", None),

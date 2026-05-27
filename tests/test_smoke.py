@@ -163,6 +163,7 @@ def test_finalize_destroys_collision_sensor_before_scenario_runner_cleanup() -> 
     adapter._client = SimpleNamespace(stop_recorder=lambda: calls.append("stop_recorder"))
     adapter._destroy_spawned_actors = lambda: calls.append("destroy_spawned_actors")
     adapter._stop_scenario_runner_module = lambda: calls.append("stop_scenario_runner")
+    adapter._clear_dynamic_actors = lambda: calls.append("clear_dynamic_actors")
 
     adapter._finalize()
 
@@ -170,6 +171,7 @@ def test_finalize_destroys_collision_sensor_before_scenario_runner_cleanup() -> 
         "stop_recorder",
         "destroy_spawned_actors",
         "stop_scenario_runner",
+        "clear_dynamic_actors",
     ]
     assert adapter._finalized is True
 
@@ -184,13 +186,46 @@ def test_finalize_continues_after_recorder_stop_failure() -> None:
     )
     adapter._destroy_spawned_actors = lambda: calls.append("destroy_spawned_actors")
     adapter._stop_scenario_runner_module = lambda: calls.append("stop_scenario_runner")
+    adapter._clear_dynamic_actors = lambda: calls.append("clear_dynamic_actors")
 
     adapter._finalize()
 
     assert calls == [
         "destroy_spawned_actors",
         "stop_scenario_runner",
+        "clear_dynamic_actors",
     ]
+    assert adapter._finalized is True
+
+
+def test_finalize_clears_dynamic_actors_and_leaves_server_async() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    vehicle = _FakeActor(actor_id=1, type_id="vehicle.tesla.model3")
+    traffic_light = _FakeActor(actor_id=2, type_id="traffic.traffic_light")
+    world = _FakeSettingsWorld(
+        [vehicle, traffic_light], synchronous_mode=True, fixed_delta_seconds=0.05
+    )
+    traffic_manager = _FakeTrafficManager()
+
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._client = SimpleNamespace(
+        stop_recorder=lambda: None,
+        get_trafficmanager=lambda port: traffic_manager,
+    )
+    adapter._world = world
+    adapter._scenario_runner_tm_port = 8000
+    adapter._destroy_spawned_actors = lambda: None
+    adapter._stop_scenario_runner_module = lambda: None
+
+    adapter._finalize()
+
+    assert vehicle.destroy_calls == 1
+    assert traffic_light.destroy_calls == 0
+    assert world.settings.synchronous_mode is False
+    assert world.settings.fixed_delta_seconds is None
+    assert world.applied_settings is world.settings
+    assert traffic_manager.sync_calls == [False]
     assert adapter._finalized is True
 
 
@@ -259,6 +294,7 @@ def test_reset_finalizes_partial_state_on_failure(tmp_path) -> None:
     adapter._clear_dynamic_actors = lambda: calls.append("clear_dynamic_actors")
     adapter._apply_world_settings = lambda: calls.append("apply_world_settings")
     adapter._client = SimpleNamespace(start_recorder=lambda path: calls.append(("recorder", path)))
+
     def start_scenario_runner(scenario_pack, params):
         assert adapter._sr_ego_control_ticks == 0
         assert adapter._external_control_prepared_actor_id is None
