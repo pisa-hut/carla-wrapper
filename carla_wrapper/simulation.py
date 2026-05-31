@@ -24,6 +24,7 @@ from pisa_api.simulator import (
     ShapeData,
     ShapeDimensionData,
     ShapeType,
+    ShouldQuitResponse,
     SimulatorPreconditionFailed,
     SimulatorTimeout,
     SimulatorUnavailable,
@@ -164,8 +165,8 @@ class CarlaAdapter:
             )
         logger.info("CARLA service launched.")
 
-    def should_quit(self) -> bool:
-        return self._quit_flag
+    def should_quit(self) -> ShouldQuitResponse:
+        return ShouldQuitResponse(should_quit=self._quit_flag)
 
     def init(self, request: InitRequest) -> None:
         self._output_base = request.output_dir

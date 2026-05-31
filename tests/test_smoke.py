@@ -834,9 +834,7 @@ class _FakeKinematicActor:
         self.x = x
         self.y = y
         self.z = z
-        self.bounding_box = SimpleNamespace(
-            extent=SimpleNamespace(x=2.0, y=1.0, z=0.75)
-        )
+        self.bounding_box = SimpleNamespace(extent=SimpleNamespace(x=2.0, y=1.0, z=0.75))
 
     def get_velocity(self):
         return SimpleNamespace(x=1.0, y=0.0, z=0.0)
