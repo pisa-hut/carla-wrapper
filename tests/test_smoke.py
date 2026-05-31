@@ -277,6 +277,99 @@ def test_prepare_reused_server_forces_async_and_clears_dynamic_actors() -> None:
     assert traffic_light.destroy_calls == 0
 
 
+def test_runtime_frame_uses_reset_relative_time() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    actor = _FakeKinematicActor(actor_id=1)
+    world = _FakeRuntimeWorld(actor, frame=120, elapsed_seconds=12.5)
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._world = world
+    adapter._ego_vehicle = actor
+    adapter._objects_by_id = {}
+    adapter._prev_yaw_rate = {}
+    adapter._collision_lock = _FakeLock()
+    adapter._collision_events = []
+    adapter._last_object_index_by_actor_id = {}
+    adapter._last_applied_control = None
+    adapter._yaw_sign = 1.0
+    adapter._yaw_offset_deg = 0.0
+    adapter.config = {}
+
+    adapter._reset_episode_clock()
+    frame = adapter._collect_runtime_frame()
+
+    assert frame.sim_time_ns == 0
+    assert frame.objects[0].kinematic.time_ns == 0
+    assert frame.extras["carla_frame"] == 120
+    assert frame.extras["carla_time_ns"] == 12_500_000_000
+    assert frame.extras["episode_frame"] == 0
+
+    world.frame = 122
+    world.elapsed_seconds = 12.6
+    frame = adapter._collect_runtime_frame()
+
+    assert frame.sim_time_ns == 100_000_000
+    assert frame.objects[0].kinematic.time_ns == 100_000_000
+    assert frame.extras["episode_frame"] == 2
+
+
+def test_collect_objects_keeps_ego_first_and_sorts_other_actors_by_xy() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    ego = _FakeKinematicActor(actor_id=1, x=10.0, y=10.0)
+    first = _FakeKinematicActor(actor_id=2, x=1.0, y=5.0)
+    second = _FakeKinematicActor(actor_id=3, x=2.0, y=1.0)
+    third = _FakeKinematicActor(actor_id=4, x=2.0, y=3.0)
+    world = _FakeRuntimeWorld([third, ego, second, first], frame=1, elapsed_seconds=0.0)
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._world = world
+    adapter._ego_vehicle = ego
+    adapter._objects_by_id = {}
+    adapter._prev_yaw_rate = {}
+    adapter._time_ns = 0
+    adapter._last_object_index_by_actor_id = {}
+    adapter._episode_start_carla_time_ns = 0
+    adapter._yaw_sign = 1.0
+    adapter._yaw_offset_deg = 0.0
+    adapter.config = {}
+
+    objects, _, _, _ = adapter._collect_objects()
+
+    assert [obj.kinematic.x for obj in objects] == [10.0, 1.0, 2.0, 2.0]
+    assert [obj.kinematic.y for obj in objects] == [10.0, 5.0, 1.0, 3.0]
+    assert adapter._last_object_index_by_actor_id == {1: 0, 2: 1, 3: 2, 4: 3}
+
+
+def test_collision_details_include_episode_relative_time() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._episode_start_carla_time_ns = 12_500_000_000
+    adapter._episode_start_carla_frame = 120
+    adapter._collision_lock = _FakeLock()
+    adapter._collision_events = [
+        {
+            "frame": 122,
+            "timestamp": 12.6,
+            "actor_id": 1,
+            "other_actor_id": 2,
+            "other_actor_type_id": "vehicle.test",
+            "other_actor_semantic_tags": [],
+            "normal_impulse": {"x": 1.0, "y": 2.0, "z": 2.0},
+        }
+    ]
+    adapter._ego_vehicle = SimpleNamespace(id=1)
+    adapter._last_object_index_by_actor_id = {1: 0, 2: 1}
+
+    collisions = adapter._collect_collision_infos()
+
+    assert len(collisions) == 1
+    assert collisions[0].details["carla_frame"] == 122
+    assert collisions[0].details["episode_frame"] == 2
+    assert collisions[0].details["carla_timestamp_seconds"] == 12.6
+    assert collisions[0].details["timestamp_seconds"] == pytest.approx(0.1)
+
+
 def test_reset_finalizes_partial_state_on_failure(tmp_path) -> None:
     from carla_wrapper.simulation import CarlaAdapter
 
@@ -691,6 +784,66 @@ class _FakeScenarioTree:
 
     def tick_once(self):
         self._calls.append("tree_tick")
+
+
+class _FakeLock:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeActorList(list):
+    def filter(self, pattern):
+        prefix = pattern.removesuffix("*")
+        return [actor for actor in self if actor.type_id.startswith(prefix)]
+
+
+class _FakeRuntimeWorld:
+    def __init__(self, actors, frame, elapsed_seconds):
+        if not isinstance(actors, list):
+            actors = [actors]
+        self.actors = _FakeActorList(actors)
+        self.frame = frame
+        self.elapsed_seconds = elapsed_seconds
+
+    def get_snapshot(self):
+        return SimpleNamespace(
+            frame=self.frame,
+            timestamp=SimpleNamespace(elapsed_seconds=self.elapsed_seconds),
+        )
+
+    def get_actors(self):
+        return self.actors
+
+
+class _FakeKinematicActor:
+    def __init__(self, actor_id, x=0.0, y=0.0, z=0.0):
+        self.id = actor_id
+        self.type_id = "vehicle.test"
+        self.x = x
+        self.y = y
+        self.z = z
+        self.bounding_box = SimpleNamespace(
+            extent=SimpleNamespace(x=2.0, y=1.0, z=0.75)
+        )
+
+    def get_velocity(self):
+        return SimpleNamespace(x=1.0, y=0.0, z=0.0)
+
+    def get_acceleration(self):
+        return SimpleNamespace(x=0.0, y=0.0, z=0.0)
+
+    def get_angular_velocity(self):
+        return SimpleNamespace(z=0.0)
+
+    def get_transform(self):
+        return SimpleNamespace(
+            location=SimpleNamespace(x=self.x, y=self.y, z=self.z),
+            rotation=SimpleNamespace(yaw=0.0),
+            get_forward_vector=lambda: SimpleNamespace(x=1.0, y=0.0, z=0.0),
+        )
 
 
 class _FakeBlackboard:

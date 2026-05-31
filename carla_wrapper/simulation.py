@@ -143,6 +143,8 @@ class CarlaAdapter:
         self._traffic_manager = None
         self._traffic_manager_sync_enabled = False
         self._pre_scenario_actor_ids: set[int] | None = None
+        self._episode_start_carla_time_ns: int | None = None
+        self._episode_start_carla_frame: int | None = None
 
         self._server_log_path = "/mnt/output/carla_server"
         os.makedirs(self._server_log_path, exist_ok=True)
@@ -215,6 +217,8 @@ class CarlaAdapter:
         try:
             self._output_dir = self._output_base / request.output_dir
             self._time_ns = 0
+            self._episode_start_carla_time_ns = None
+            self._episode_start_carla_frame = None
             self._quit_flag = False
             self._clear_collision_events()
             self._pre_scenario_actor_ids = None
@@ -245,6 +249,7 @@ class CarlaAdapter:
             if self._sync:
                 self._world.tick()
 
+            self._reset_episode_clock()
             return self._collect_runtime_frame()
         except Exception:
             logger.exception("Failed to reset CARLA simulation; finalizing partial state")
@@ -583,7 +588,7 @@ class CarlaAdapter:
         openscenario_params: dict[str, str] = {}
         if params:
             openscenario_params = {str(k): str(v) for k, v in params.items()}
-
+        logger.info(f"parameters: {openscenario_params}")
         xosc_name = sps.name
         if not xosc_name:
             raise RuntimeError("ScenarioPack name is required for open_scenario1")
@@ -975,11 +980,13 @@ class CarlaAdapter:
         return settings_payload
 
     def _collect_runtime_frame(self) -> RuntimeFrameData:
-        objects, sim_time_ns, carla_frame = self._collect_objects()
+        objects, sim_time_ns, carla_frame, carla_time_ns = self._collect_objects()
         collisions = self._collect_collision_infos()
 
         extras_payload = {
             "carla_frame": carla_frame,
+            "carla_time_ns": carla_time_ns,
+            "episode_frame": self._episode_frame_from_carla_frame(carla_frame),
             "object_index_by_actor_id": {
                 str(actor_id): index
                 for actor_id, index in self._last_object_index_by_actor_id.items()
@@ -1001,12 +1008,36 @@ class CarlaAdapter:
             extras=extras_payload,
         )
 
-    def _collect_objects(self) -> tuple[list[ObjectStateData], int, int]:
-        if self._world is None:
-            return [], 0, 0
+    def _reset_episode_clock(self) -> None:
+        if getattr(self, "_world", None) is None:
+            self._episode_start_carla_time_ns = 0
+            self._episode_start_carla_frame = 0
+            return
 
         snapshot = self._world.get_snapshot()
-        sim_time_ns = int(snapshot.timestamp.elapsed_seconds * 1e9)
+        self._episode_start_carla_time_ns = int(
+            getattr(snapshot.timestamp, "elapsed_seconds", 0.0) * 1e9
+        )
+        self._episode_start_carla_frame = int(getattr(snapshot, "frame", 0))
+        self._time_ns = 0
+
+    def _episode_time_from_carla_time_ns(self, carla_time_ns: int) -> int:
+        if getattr(self, "_episode_start_carla_time_ns", None) is None:
+            self._episode_start_carla_time_ns = carla_time_ns
+        return max(0, carla_time_ns - self._episode_start_carla_time_ns)
+
+    def _episode_frame_from_carla_frame(self, carla_frame: int) -> int:
+        if getattr(self, "_episode_start_carla_frame", None) is None:
+            self._episode_start_carla_frame = carla_frame
+        return max(0, carla_frame - self._episode_start_carla_frame)
+
+    def _collect_objects(self) -> tuple[list[ObjectStateData], int, int, int]:
+        if self._world is None:
+            return [], 0, 0, 0
+
+        snapshot = self._world.get_snapshot()
+        carla_time_ns = int(snapshot.timestamp.elapsed_seconds * 1e9)
+        sim_time_ns = self._episode_time_from_carla_time_ns(carla_time_ns)
         carla_frame = int(snapshot.frame)
 
         actors = []
@@ -1076,9 +1107,12 @@ class CarlaAdapter:
             objects.append(upsert(self._ego_vehicle))
             ordered_actors.append(self._ego_vehicle)
 
-        for actor in actors:
-            if self._ego_vehicle is not None and actor.id == self._ego_vehicle.id:
-                continue
+        non_ego_actors = [
+            actor
+            for actor in actors
+            if self._ego_vehicle is None or actor.id != self._ego_vehicle.id
+        ]
+        for actor in sorted(non_ego_actors, key=self._actor_sort_key):
             objects.append(upsert(actor))
             ordered_actors.append(actor)
 
@@ -1089,7 +1123,17 @@ class CarlaAdapter:
 
         logger.debug("Collected %s objects at time %s ns", len(objects), sim_time_ns)
 
-        return objects, sim_time_ns, carla_frame
+        return objects, sim_time_ns, carla_frame, carla_time_ns
+
+    def _actor_sort_key(self, actor) -> tuple[float, float, float, int]:
+        transform = actor.get_transform()
+        location = transform.location
+        return (
+            float(location.x),
+            float(location.y) * self._yaw_sign,
+            float(location.z),
+            int(actor.id),
+        )
 
     def _setup_collision_sensor(self) -> None:
         self._destroy_collision_sensor()
@@ -1169,11 +1213,18 @@ class CarlaAdapter:
             if actor_a_index is None and event["actor_id"] == ego_actor_id:
                 actor_a_index = 0
             actor_b_index = self._last_object_index_by_actor_id.get(event["other_actor_id"])
+            carla_timestamp_seconds = event["timestamp"]
+            episode_time_ns = self._episode_time_from_carla_time_ns(
+                int(carla_timestamp_seconds * 1e9)
+            )
+            episode_timestamp_seconds = episode_time_ns / 1e9
 
             impulse = event["normal_impulse"]
             details_payload = {
                 "carla_frame": event["frame"],
-                "timestamp_seconds": event["timestamp"],
+                "carla_timestamp_seconds": carla_timestamp_seconds,
+                "episode_frame": self._episode_frame_from_carla_frame(event["frame"]),
+                "timestamp_seconds": episode_timestamp_seconds,
                 "other_actor_type_id": event["other_actor_type_id"],
                 "other_actor_semantic_tags": event["other_actor_semantic_tags"],
                 "normal_impulse": {
