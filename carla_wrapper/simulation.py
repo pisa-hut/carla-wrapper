@@ -13,17 +13,22 @@ from pisa_api.simulator import (
     ControlCommand,
     ControlMode,
     InitRequest,
-    InitResponse,
+    InvalidSimulatorRequest,
     ObjectKinematicData,
     ObjectStateData,
     ResetRequest,
+    ResetResponse,
     RoadObjectType,
     RuntimeFrameData,
     ScenarioPackData,
     ShapeData,
     ShapeDimensionData,
     ShapeType,
+    SimulatorPreconditionFailed,
+    SimulatorTimeout,
+    SimulatorUnavailable,
     StepRequest,
+    StepResponse,
 )
 
 from .lifecycle import (
@@ -162,7 +167,7 @@ class CarlaAdapter:
     def should_quit(self) -> bool:
         return self._quit_flag
 
-    def init(self, request: InitRequest) -> InitResponse:
+    def init(self, request: InitRequest) -> None:
         self._output_base = request.output_dir
         self.config = request.config
         self.scenario = request.scenario
@@ -171,7 +176,7 @@ class CarlaAdapter:
             self._finalize()
 
         if not self._ensure_connected():
-            return InitResponse(success=False, msg="Failed to connect to CARLA within timeout")
+            raise SimulatorTimeout("Timed out connecting to CARLA")
 
         self._fixed_delta_seconds = request.dt
 
@@ -206,13 +211,14 @@ class CarlaAdapter:
         self._pre_scenario_actor_ids = None
         self._prepare_reused_server_state()
 
-        return InitResponse(success=True)
+        return None
 
-    def reset(self, request: ResetRequest) -> RuntimeFrameData:
+    def reset(self, request: ResetRequest) -> ResetResponse:
         if not self._finalized:
             self._finalize()
 
         self._finalized = False
+        success = False
 
         try:
             self._output_dir = self._output_base / request.output_dir
@@ -250,15 +256,17 @@ class CarlaAdapter:
                 self._world.tick()
 
             self._reset_episode_clock()
-            return self._collect_runtime_frame()
-        except Exception:
-            logger.exception("Failed to reset CARLA simulation; finalizing partial state")
-            self._finalize()
-            raise
+            response = ResetResponse(frame=self._collect_runtime_frame())
+            success = True
+            return response
+        finally:
+            if not success:
+                logger.error("Failed to reset CARLA simulation; finalizing partial state")
+                self._finalize()
 
-    def step(self, request: StepRequest) -> RuntimeFrameData:
+    def step(self, request: StepRequest) -> StepResponse:
         if self._world is None:
-            raise RuntimeError("CARLA world is not available")
+            raise SimulatorUnavailable("CARLA world is not available")
 
         self._tick_scenario_runner_module()
         self._apply_ctrl(request.ctrl_cmd)
@@ -266,7 +274,7 @@ class CarlaAdapter:
             self._world.tick()
         else:
             self._world.wait_for_tick()
-        return self._collect_runtime_frame()
+        return StepResponse(frame=self._collect_runtime_frame())
 
     def stop(self) -> None:
         self._finalize()
@@ -364,29 +372,31 @@ class CarlaAdapter:
         generate_opendrive_world: bool = True,
     ) -> None:
         if sps is None:
-            raise RuntimeError("ScenarioPack is required to prepare CARLA world")
+            raise InvalidSimulatorRequest("ScenarioPack is required to prepare CARLA world")
 
         if self._server_version is None and not self._ensure_connected():
-            raise RuntimeError("Failed to connect to CARLA before loading world")
+            raise SimulatorTimeout("Timed out connecting to CARLA before loading world")
         if self._client is None:
-            raise RuntimeError("CARLA client is not available")
+            raise SimulatorUnavailable("CARLA client is not available")
 
         if not generate_opendrive_world:
             world = self._client.get_world()
             if world is None:
-                raise RuntimeError("CARLA world is not available")
+                raise SimulatorUnavailable("CARLA world is not available")
             self._world = world
             return
 
         opendrive_name = sps.map_name
         if not opendrive_name:
-            raise RuntimeError("ScenarioPack map_name is required to generate CARLA world")
+            raise InvalidSimulatorRequest(
+                "ScenarioPack map_name is required to generate CARLA world"
+            )
         opendrive_path = Path(f"/mnt/map/xodr/{opendrive_name}.xodr").resolve()
 
         world = None
         if hasattr(self._client, "generate_opendrive_world"):
             if not opendrive_path.exists():
-                raise RuntimeError("OpenDRIVE path not found for CARLA world generation")
+                raise InvalidSimulatorRequest("OpenDRIVE path not found for CARLA world generation")
 
             with open(opendrive_path, encoding="utf-8") as f:
                 opendrive_str = f.read()
@@ -398,22 +408,27 @@ class CarlaAdapter:
             self._client.set_timeout(300.0)
             try:
                 logger.info("Generating CARLA world from OpenDRIVE: %s", opendrive_path)
-                world = self._client.generate_opendrive_world(
-                    opendrive_str,
-                    carla.OpendriveGenerationParameters(
-                        vertex_distance=2.0,
-                        # max_road_length=500.0,
-                        wall_height=0.0,
-                        additional_width=5.6,
-                        smooth_junctions=True,
-                        enable_mesh_visibility=True,
-                    ),
-                )
+                try:
+                    world = self._client.generate_opendrive_world(
+                        opendrive_str,
+                        carla.OpendriveGenerationParameters(
+                            vertex_distance=2.0,
+                            # max_road_length=500.0,
+                            wall_height=0.0,
+                            additional_width=5.6,
+                            smooth_junctions=True,
+                            enable_mesh_visibility=True,
+                        ),
+                    )
+                except Exception as exc:
+                    raise InvalidSimulatorRequest(
+                        f"Failed to generate CARLA world from OpenDRIVE map: {opendrive_name}"
+                    ) from exc
                 logger.info("Generated CARLA world from OpenDRIVE: %s", opendrive_path)
             finally:
                 self._client.set_timeout(default_timeout)
         else:
-            raise RuntimeError("Cannot determine CARLA world to load")
+            raise InvalidSimulatorRequest("Cannot determine CARLA world to load")
 
         if world is None:
             world = self._client.get_world()
@@ -422,7 +437,7 @@ class CarlaAdapter:
 
     def _sync_world_from_scenario_runner(self) -> None:
         if self._client is None:
-            raise RuntimeError("CARLA client is not available")
+            raise SimulatorUnavailable("CARLA client is not available")
 
         world = None
         try:
@@ -433,14 +448,14 @@ class CarlaAdapter:
         if world is None:
             world = self._client.get_world()
         if world is None:
-            raise RuntimeError("CARLA world is not available after ScenarioRunner setup")
+            raise SimulatorUnavailable("CARLA world is not available after ScenarioRunner setup")
 
         self._world = world
         CarlaDataProvider.set_world(world)
 
     def _load_and_wait_for_scenario_runner_world(self, config=None) -> None:
         if self._client is None:
-            raise RuntimeError("CARLA client is not available")
+            raise SimulatorUnavailable("CARLA client is not available")
 
         try:
             world = self._client.get_world()
@@ -455,7 +470,7 @@ class CarlaAdapter:
                 logger.exception("Failed to read CARLA world from CarlaDataProvider")
 
         if world is None:
-            raise RuntimeError("CARLA world is not available after ScenarioRunner setup")
+            raise SimulatorUnavailable("CARLA world is not available after ScenarioRunner setup")
 
         self._world = world
         self._apply_world_settings()
@@ -474,7 +489,7 @@ class CarlaAdapter:
             map_name = get_map().name.split("/")[-1]
             town_name = Path(str(town)).name
             if map_name not in (str(town), town_name, "OpenDriveMap"):
-                raise RuntimeError(
+                raise InvalidSimulatorRequest(
                     f"CARLA server uses map '{map_name}', but scenario requires '{town}'"
                 )
 
@@ -591,10 +606,10 @@ class CarlaAdapter:
         logger.info(f"parameters: {openscenario_params}")
         xosc_name = sps.name
         if not xosc_name:
-            raise RuntimeError("ScenarioPack name is required for open_scenario1")
+            raise InvalidSimulatorRequest("ScenarioPack name is required for open_scenario1")
         xosc_path = Path(f"/mnt/scenario/{xosc_name}.xosc").resolve()
         if not xosc_path.exists():
-            raise RuntimeError(f"OpenSCENARIO file not found: {xosc_path}")
+            raise InvalidSimulatorRequest(f"OpenSCENARIO file not found: {xosc_path}")
 
         config = OpenScenarioConfiguration(str(xosc_path), self._client, openscenario_params)
         self._load_and_wait_for_scenario_runner_world(config)
@@ -613,12 +628,14 @@ class CarlaAdapter:
                 actor_category=ego_config.category,
             )
             if actor is None:
-                raise RuntimeError(f"Failed to spawn ego vehicle '{ego_config.rolename}'")
+                raise SimulatorPreconditionFailed(
+                    f"Failed to spawn ego vehicle '{ego_config.rolename}'"
+                )
             ego_vehicles.append(actor)
             self._sr_ego_vehicles = ego_vehicles
         logger.debug("Spawned %s ego vehicles for scenario", len(ego_vehicles))
         if not ego_vehicles:
-            raise RuntimeError("OpenSCENARIO did not define any ego vehicles")
+            raise InvalidSimulatorRequest("OpenSCENARIO did not define any ego vehicles")
 
         scenario = OpenScenario(
             world=self._world,
@@ -638,7 +655,7 @@ class CarlaAdapter:
         params: dict | None,
     ) -> None:
         if self._client is None or self._world is None:
-            raise RuntimeError("CARLA client/world not available")
+            raise SimulatorUnavailable("CARLA client/world not available")
 
         self._sr_ego_control_ticks = 0
         self._sr_last_tick_timestamp = None
@@ -653,14 +670,16 @@ class CarlaAdapter:
             case "carla_lb_route":
                 route_name = self.scenario.name
                 if self.scenario.path is None:
-                    raise RuntimeError("Scenario path is required for carla_lb_route")
+                    raise InvalidSimulatorRequest("Scenario path is required for carla_lb_route")
                 xml_path = str(self.scenario.path / f"{route_name}.xml")
                 config = RouteParser.parse_routes_file(xml_path, 0)
                 logger.info("Parsed route scenario config: %s", config)
                 config = config[0]
 
             case _:
-                raise RuntimeError(f"Unsupported scenario format: {self.scenario.format}")
+                raise InvalidSimulatorRequest(
+                    f"Unsupported scenario format: {self.scenario.format}"
+                )
 
         CarlaDataProvider.set_traffic_manager_port(self._scenario_runner_tm_port)
         tm = self._client.get_trafficmanager(self._scenario_runner_tm_port)
@@ -680,9 +699,13 @@ class CarlaAdapter:
             case "carla_lb_route":
                 scenario = RouteScenario(world=self._world, config=config)
                 self._ego_vehicle = scenario.ego_vehicles[0]
+                if self._ego_vehicle is None:
+                    raise SimulatorPreconditionFailed("Failed to spawn route ego vehicle")
 
             case _:
-                raise RuntimeError(f"Unsupported scenario format: {self.scenario.format}")
+                raise InvalidSimulatorRequest(
+                    f"Unsupported scenario format: {self.scenario.format}"
+                )
 
         self._sr_scenario = scenario
         self._sr_tree = scenario.scenario_tree

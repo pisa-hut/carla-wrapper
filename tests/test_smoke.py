@@ -3,7 +3,14 @@
 from types import SimpleNamespace
 
 import pytest
-from pisa_api.simulator import ControlCommand, ControlMode, RuntimeFrameData, StepRequest
+from pisa_api.simulator import (
+    ControlCommand,
+    ControlMode,
+    InvalidSimulatorRequest,
+    RuntimeFrameData,
+    SimulatorTimeout,
+    StepRequest,
+)
 
 
 def test_public_imports_use_pisa_api_simulator_contract() -> None:
@@ -34,9 +41,10 @@ def test_step_applies_external_control_after_scenario_runner_tick() -> None:
         payload={"throttle": 0.0, "brake": 1.0, "steer": 0.0},
     )
 
-    adapter.step(StepRequest(ctrl_cmd=ctrl))
+    response = adapter.step(StepRequest(ctrl_cmd=ctrl))
 
     assert calls == ["scenario_runner", ("control", ctrl), "world_tick"]
+    assert isinstance(response.frame, RuntimeFrameData)
 
 
 def test_disable_scenario_runner_ego_control_removes_only_ego(monkeypatch) -> None:
@@ -432,12 +440,13 @@ def test_open_scenario_reset_delegates_world_loading_to_scenario_runner(tmp_path
 
     request = SimpleNamespace(output_dir="run", scenario_pack=object(), params={})
 
-    adapter.reset(request)
+    response = adapter.reset(request)
 
     assert ("ensure_world", False) in calls
     assert "apply_world_settings" not in calls
     assert calls.index("start_scenario_runner") < calls.index("start_recorder")
     assert calls.index("start_recorder") < calls.index("tick_scenario_runner")
+    assert isinstance(response.frame, RuntimeFrameData)
 
 
 def test_ensure_world_can_skip_opendrive_generation() -> None:
@@ -459,7 +468,7 @@ def test_ensure_world_requires_scenario_pack() -> None:
 
     adapter = CarlaAdapter.__new__(CarlaAdapter)
 
-    with pytest.raises(RuntimeError, match="ScenarioPack is required"):
+    with pytest.raises(InvalidSimulatorRequest, match="ScenarioPack is required"):
         adapter._ensure_world(None)
 
 
@@ -471,7 +480,7 @@ def test_ensure_world_stops_when_reconnect_fails() -> None:
     adapter._client = None
     adapter._ensure_connected = lambda: False
 
-    with pytest.raises(RuntimeError, match="Failed to connect to CARLA"):
+    with pytest.raises(SimulatorTimeout, match="Timed out connecting to CARLA"):
         adapter._ensure_world(SimpleNamespace(map_name="Town01"))
 
 
@@ -499,7 +508,7 @@ def test_open_scenario_missing_xosc_fails_before_scenario_runner(monkeypatch) ->
     adapter._traffic_manager_sync_enabled = False
     adapter.scenario = SimpleNamespace(format="open_scenario1")
 
-    with pytest.raises(RuntimeError, match="OpenSCENARIO file not found"):
+    with pytest.raises(InvalidSimulatorRequest, match="OpenSCENARIO file not found"):
         adapter._start_scenario_runner_module(SimpleNamespace(name="missing"), {})
 
 
