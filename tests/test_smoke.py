@@ -47,6 +47,19 @@ def test_step_applies_external_control_after_scenario_runner_tick() -> None:
     assert isinstance(response.frame, RuntimeFrameData)
 
 
+def test_should_quit_returns_response_message() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._quit_flag = True
+    adapter._quit_msg = "ScenarioRunner finished with status SUCCESS"
+
+    response = adapter.should_quit()
+
+    assert response.should_quit is True
+    assert response.msg == "ScenarioRunner finished with status SUCCESS"
+
+
 def test_disable_scenario_runner_ego_control_removes_only_ego(monkeypatch) -> None:
     from carla_wrapper import simulation
 
@@ -161,6 +174,45 @@ def test_scenario_runner_tree_ticks_once_per_world_timestamp(monkeypatch) -> Non
 
     assert calls == ["game_time", "data_provider", "tree_tick"]
     assert adapter._sr_ego_control_ticks == 1
+
+
+def test_scenario_runner_completion_sets_quit_message(monkeypatch) -> None:
+    from carla_wrapper import simulation
+
+    calls = []
+    monkeypatch.setattr(
+        simulation,
+        "py_trees",
+        SimpleNamespace(common=SimpleNamespace(Status=SimpleNamespace(RUNNING="RUNNING"))),
+    )
+    monkeypatch.setattr(
+        simulation,
+        "GameTime",
+        SimpleNamespace(on_carla_tick=lambda timestamp: calls.append("game_time")),
+    )
+    monkeypatch.setattr(
+        simulation,
+        "CarlaDataProvider",
+        SimpleNamespace(on_carla_tick=lambda: calls.append("data_provider")),
+    )
+
+    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
+    adapter._world = _FakeScenarioWorld()
+    adapter._sr_scenario = object()
+    adapter._sr_running = True
+    adapter._sr_tree = _FakeScenarioTree(calls, status="SUCCESS")
+    adapter._ego_vehicle = SimpleNamespace(id=1)
+    adapter._disable_sr_ego_control = False
+    adapter._sr_ego_control_ticks = 0
+    adapter._sr_last_tick_timestamp = None
+    adapter._quit_flag = False
+    adapter._quit_msg = ""
+
+    adapter._tick_scenario_runner_module()
+
+    response = adapter.should_quit()
+    assert response.should_quit is True
+    assert response.msg == "ScenarioRunner finished with status SUCCESS"
 
 
 def test_finalize_destroys_collision_sensor_before_scenario_runner_cleanup() -> None:
@@ -787,8 +839,8 @@ class _FakeScenarioWorld:
 
 
 class _FakeScenarioTree:
-    def __init__(self, calls):
-        self.status = "RUNNING"
+    def __init__(self, calls, status="RUNNING"):
+        self.status = status
         self._calls = calls
 
     def tick_once(self):

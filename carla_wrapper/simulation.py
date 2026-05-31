@@ -151,6 +151,7 @@ class CarlaAdapter:
         self._pre_scenario_actor_ids: set[int] | None = None
         self._episode_start_carla_time_ns: int | None = None
         self._episode_start_carla_frame: int | None = None
+        self._quit_msg = ""
 
         self._server_log_path = "/mnt/output/carla_server"
         os.makedirs(self._server_log_path, exist_ok=True)
@@ -166,7 +167,10 @@ class CarlaAdapter:
         logger.info("CARLA service launched.")
 
     def should_quit(self) -> ShouldQuitResponse:
-        return ShouldQuitResponse(should_quit=self._quit_flag)
+        msg = getattr(self, "_quit_msg", "") if self._quit_flag else ""
+        if self._quit_flag and not msg:
+            msg = "CARLA simulator requested quit"
+        return ShouldQuitResponse(should_quit=self._quit_flag, msg=msg)
 
     def init(self, request: InitRequest) -> None:
         self._output_base = request.output_dir
@@ -192,6 +196,7 @@ class CarlaAdapter:
         self._native_ackermann_settings_actor_id = None
         self._native_ackermann_settings_payload = None
         self._quit_flag = False
+        self._quit_msg = ""
 
         self._spawned_actor_ids: set[int] = set()
         self._disable_sr_ego_control = bool(
@@ -227,6 +232,7 @@ class CarlaAdapter:
             self._episode_start_carla_time_ns = None
             self._episode_start_carla_frame = None
             self._quit_flag = False
+            self._quit_msg = ""
             self._clear_collision_events()
             self._pre_scenario_actor_ids = None
             self._sr_ego_control_ticks = 0
@@ -809,6 +815,7 @@ class CarlaAdapter:
         if self._sr_tree.status != py_trees.common.Status.RUNNING:
             self._sr_running = False
             self._quit_flag = True
+            self._quit_msg = f"ScenarioRunner finished with status {self._sr_tree.status}"
 
     def _disable_scenario_runner_ego_control(self) -> None:
         if not getattr(self, "_disable_sr_ego_control", True):
