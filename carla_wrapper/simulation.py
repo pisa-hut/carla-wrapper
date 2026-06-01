@@ -812,6 +812,16 @@ class CarlaAdapter:
         self._sr_ego_control_ticks += 1
         if self._sr_ego_control_ticks >= 1:
             self._disable_scenario_runner_ego_control()
+        if (
+            self._sr_tree.status == py_trees.common.Status.FAILURE
+            or self._sr_tree.status == py_trees.common.Status.INVALID
+        ):
+            self._sr_running = False
+            self._quit_flag = True
+            logger.error("ScenarioRunner tree failed with status: %s", self._sr_tree.status)
+            raise SimulatorPreconditionFailed(
+                f"ScenarioRunner tree failed with status: {self._sr_tree.status}"
+            )
         if self._sr_tree.status != py_trees.common.Status.RUNNING:
             self._sr_running = False
             self._quit_flag = True
