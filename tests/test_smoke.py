@@ -107,7 +107,7 @@ def test_scenario_runner_ego_control_is_disabled_after_first_tick(monkeypatch) -
         "py_trees",
         SimpleNamespace(
             blackboard=SimpleNamespace(Blackboard=lambda: blackboard),
-            common=SimpleNamespace(Status=SimpleNamespace(RUNNING="RUNNING")),
+            common=SimpleNamespace(Status=SimpleNamespace(RUNNING="RUNNING", FAILURE="FAILURE", INVALID="INVALID")),
         ),
     )
     monkeypatch.setattr(
@@ -145,7 +145,7 @@ def test_scenario_runner_tree_ticks_once_per_world_timestamp(monkeypatch) -> Non
     monkeypatch.setattr(
         simulation,
         "py_trees",
-        SimpleNamespace(common=SimpleNamespace(Status=SimpleNamespace(RUNNING="RUNNING"))),
+        SimpleNamespace(common=SimpleNamespace(Status=SimpleNamespace(RUNNING="RUNNING", FAILURE="FAILURE", INVALID="INVALID"))),
     )
     monkeypatch.setattr(
         simulation,
@@ -183,7 +183,7 @@ def test_scenario_runner_completion_sets_quit_message(monkeypatch) -> None:
     monkeypatch.setattr(
         simulation,
         "py_trees",
-        SimpleNamespace(common=SimpleNamespace(Status=SimpleNamespace(RUNNING="RUNNING"))),
+        SimpleNamespace(common=SimpleNamespace(Status=SimpleNamespace(RUNNING="RUNNING", FAILURE="FAILURE", INVALID="INVALID"))),
     )
     monkeypatch.setattr(
         simulation,
