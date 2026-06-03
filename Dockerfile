@@ -22,9 +22,17 @@ ADD https://security.ubuntu.com/ubuntu/pool/main/t/tiff/libtiff5_4.3.0-6_amd64.d
 RUN dpkg -i /tmp/libtiff5-dev.deb && rm /tmp/libtiff5-dev.deb
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-# ADD https://github.com/carla-simulator/scenario_runner.git /opt/scenario_runner
-ADD https://github.com/derekwuchengyu/scenario_runner.git /opt/scenario_runner
-RUN cp -r /opt/scenario_runner/srunner/examples/Catalogs /opt/Catalogs
+# Two srunner sources ship as different image tags (see CI matrix):
+#   - :main   → derekwuchengyu fork (default for back-compat)
+#   - :native → upstream carla-simulator/scenario_runner
+ARG SRUNNER_GIT=https://github.com/derekwuchengyu/scenario_runner.git
+ADD ${SRUNNER_GIT} /opt/scenario_runner
+# Fork ships custom example Catalogs under srunner/examples/Catalogs;
+# upstream srunner doesn't. Matrix sets WITH_CATALOGS=0 for :native.
+ARG WITH_CATALOGS=1
+RUN if [ "$WITH_CATALOGS" = "1" ]; then \
+        cp -r /opt/scenario_runner/srunner/examples/Catalogs /opt/Catalogs; \
+    fi
 
 USER carla
 WORKDIR /app
