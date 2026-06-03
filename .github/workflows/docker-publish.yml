@@ -21,6 +21,21 @@ jobs:
   build:
     runs-on: self-hosted
 
+    # Two srunner flavors shipped as separate image tags:
+    #   :main   → derekwuchengyu fork (matches the existing DB row)
+    #   :native → upstream carla-simulator/scenario_runner (powers
+    #             simulator id=3 native-carla after the DB update)
+    # Matrix entries share buildx + login steps; only the build-arg
+    # (SRUNNER_GIT) and the resulting tag differ.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: main
+            srunner_git: https://github.com/derekwuchengyu/scenario_runner.git
+          - flavor: native
+            srunner_git: https://github.com/carla-simulator/scenario_runner.git
+
     env:
       # <dockerhub-namespace>/<repo-name>; namespace comes from the
       # DOCKERHUB_USERNAME secret so the workflow works across forks.
@@ -50,6 +65,26 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f95db51fddba0c2d1ec667646a06c2ce06100226 # v3.0.0
 
+      # Single source of truth for both the docker image tag and the SIF
+      # tag, per matrix flavor. On main branch builds the tag is just the
+      # flavor name (`:main`, `:native`) — what the DB rows reference. On
+      # any other ref (feature branch, tag push, PR) we slugify ref_name
+      # and suffix it so per-branch builds don't collide on the registry.
+      - name: Compute image tag
+        id: tag
+        env:
+          FLAVOR: ${{ matrix.flavor }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            tag="$FLAVOR"
+          else
+            slug=$(echo '${{ github.ref_name }}' | sed -E 's|[^A-Za-z0-9._-]|-|g')
+            tag="$FLAVOR-$slug"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Image tag: $tag"
+
       # Login against a Docker registry except on PR
       # https://github.com/docker/login-action
       - name: Log into registry ${{ env.REGISTRY }}
@@ -76,12 +111,17 @@ jobs:
         with:
           context: .
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
+          # Override metadata-action's tags with the matrix-aware tag; keep
+          # its labels (OCI annotations: source, revision, etc.).
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Buildcache push needs registry auth, which is skipped on PR runs;
-          # disable cache I/O on PRs so the sanity build succeeds without creds.
-          cache-from: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}/{1}:buildcache', env.REGISTRY, env.IMAGE_NAME) || '' }}
-          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}/{1}:buildcache,mode=max', env.REGISTRY, env.IMAGE_NAME) || '' }}
+          build-args: |
+            SRUNNER_GIT=${{ matrix.srunner_git }}
+          # Buildcache push needs registry auth (skipped on PR runs) and must
+          # be scoped per flavor — otherwise the matrix entries trash each
+          # other's cache since their layer graphs diverge at the srunner ADD.
+          cache-from: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}/{1}:buildcache-{2}', env.REGISTRY, env.IMAGE_NAME, matrix.flavor) || '' }}
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}/{1}:buildcache-{2},mode=max', env.REGISTRY, env.IMAGE_NAME, matrix.flavor) || '' }}
 
       # Sign the resulting Docker image digest except on PRs.
       # This will only write to the public Rekor transparency log when the Docker
@@ -92,7 +132,7 @@ jobs:
         if: ${{ github.event_name != 'pull_request' }}
         env:
           # https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable
-          TAGS: ${{ steps.meta.outputs.tags }}
+          TAGS: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
           DIGEST: ${{ steps.build-and-push.outputs.digest }}
         # This step uses the identity token to provision an ephemeral certificate
         # against the sigstore community Fulcio instance.
@@ -142,12 +182,10 @@ jobs:
             [ "$attempt" = "3" ] && exit 1
           done
 
-          # OCI tags disallow '/'; slugify the same way docker/metadata-action
-          # does for type=ref,event=branch so feature-branch dispatches work.
-          REF_TAG="${{ github.ref_name }}"
-          REF_TAG="${REF_TAG//\//-}"
+          # Mirror the docker image tag so consumers can pair them by name:
+          # `:main` docker image ↔ `:main` SIF, `:native` ↔ `:native`, etc.
+          # No `:latest` alias — with multiple flavors, latest is ambiguous;
+          # per-flavor stable tags are the canonical name.
+          REF_TAG="${{ steps.tag.outputs.tag }}"
           apptainer push wrapper.sif "oras://${SIF_REPO}:${REF_TAG}"
-          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
-            apptainer push wrapper.sif "oras://${SIF_REPO}:latest"
-          fi
           echo "SIF pushed: oras://${SIF_REPO}:${REF_TAG}"
