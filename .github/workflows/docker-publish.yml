@@ -33,8 +33,11 @@ jobs:
         include:
           - flavor: main
             srunner_git: https://github.com/derekwuchengyu/scenario_runner.git
+            with_catalogs: "1"
           - flavor: native
             srunner_git: https://github.com/carla-simulator/scenario_runner.git
+            # Upstream srunner doesn't ship the fork's example Catalogs.
+            with_catalogs: "0"
 
     env:
       # <dockerhub-namespace>/<repo-name>; namespace comes from the
@@ -117,6 +120,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             SRUNNER_GIT=${{ matrix.srunner_git }}
+            WITH_CATALOGS=${{ matrix.with_catalogs }}
           # Buildcache push needs registry auth (skipped on PR runs) and must
           # be scoped per flavor — otherwise the matrix entries trash each
           # other's cache since their layer graphs diverge at the srunner ADD.
