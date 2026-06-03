@@ -22,8 +22,11 @@ ADD https://security.ubuntu.com/ubuntu/pool/main/t/tiff/libtiff5_4.3.0-6_amd64.d
 RUN dpkg -i /tmp/libtiff5-dev.deb && rm /tmp/libtiff5-dev.deb
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-# ADD https://github.com/carla-simulator/scenario_runner.git /opt/scenario_runner
-ADD https://github.com/derekwuchengyu/scenario_runner.git /opt/scenario_runner
+# Two srunner sources ship as different image tags (see CI matrix):
+#   - :main   → derekwuchengyu fork (default for back-compat)
+#   - :native → upstream carla-simulator/scenario_runner
+ARG SRUNNER_GIT=https://github.com/derekwuchengyu/scenario_runner.git
+ADD ${SRUNNER_GIT} /opt/scenario_runner
 RUN cp -r /opt/scenario_runner/srunner/examples/Catalogs /opt/Catalogs
 
 USER carla
