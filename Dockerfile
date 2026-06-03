@@ -27,7 +27,12 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 #   - :native → upstream carla-simulator/scenario_runner
 ARG SRUNNER_GIT=https://github.com/derekwuchengyu/scenario_runner.git
 ADD ${SRUNNER_GIT} /opt/scenario_runner
-RUN cp -r /opt/scenario_runner/srunner/examples/Catalogs /opt/Catalogs
+# Fork ships custom example Catalogs under srunner/examples/Catalogs;
+# upstream srunner doesn't. Matrix sets WITH_CATALOGS=0 for :native.
+ARG WITH_CATALOGS=1
+RUN if [ "$WITH_CATALOGS" = "1" ]; then \
+        cp -r /opt/scenario_runner/srunner/examples/Catalogs /opt/Catalogs; \
+    fi
 
 USER carla
 WORKDIR /app
