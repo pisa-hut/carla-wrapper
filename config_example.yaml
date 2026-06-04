@@ -89,13 +89,13 @@ kinematic_yaw_acceleration_deadband_radps2: 0.1
 ackermann_use_native_control: false
 
 # Native CARLA Ackermann speed PID proportional gain.
-ackermann_native_speed_kp: 0.15
+ackermann_native_speed_kp: 0.10
 
 # Native CARLA Ackermann speed PID integral gain.
 ackermann_native_speed_ki: 0.0
 
 # Native CARLA Ackermann speed PID derivative gain.
-ackermann_native_speed_kd: 0.25
+ackermann_native_speed_kd: 0.10
 
 # Native CARLA Ackermann acceleration PID proportional gain.
 ackermann_native_accel_kp: 0.01
@@ -104,11 +104,11 @@ ackermann_native_accel_kp: 0.01
 ackermann_native_accel_ki: 0.0
 
 # Native CARLA Ackermann acceleration PID derivative gain.
-ackermann_native_accel_kd: 0.01
+ackermann_native_accel_kd: 0.0
 
 # Proportional gain used by the fallback VehicleControl backend to convert
 # speed error into throttle.
-ackermann_speed_kp: 0.35
+ackermann_speed_kp: 0.5
 
 # Minimum non-zero throttle used by the fallback VehicleControl backend when the
 # target speed is positive and acceleration is requested.
@@ -119,15 +119,15 @@ ackermann_max_throttle: 0.75
 
 # Current speed below this value, in m/s, is treated as zero for Ackermann
 # control decisions. This filters low-speed CARLA physics noise.
-ackermann_stop_speed_threshold: 0.05
+ackermann_stop_speed_threshold: 0.25
 
 # When current speed is below this value and the target speed is high enough,
 # the fallback VehicleControl backend uses launch throttle to overcome static
 # friction and make starts less sluggish.
-ackermann_launch_speed_threshold: 0.3
+ackermann_launch_speed_threshold: 0.1
 
 # Minimum target speed, in m/s, required to use launch throttle.
-ackermann_launch_target_threshold: 0.5
+ackermann_launch_target_threshold: 0.25
 
 # Throttle used during fallback VehicleControl launch from near stop.
 ackermann_launch_throttle: 0.45
@@ -141,7 +141,7 @@ ackermann_brake_kp: 0.6
 ackermann_min_brake: 0.15
 
 # Maximum brake used by the fallback VehicleControl backend while decelerating.
-ackermann_max_brake: 0.8
+ackermann_max_brake: 1.0
 
 # Default acceleration value used for ACKERMANN commands when the payload omits
 # "acceleration" and the target speed is not below current speed. Passed through

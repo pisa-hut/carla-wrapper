@@ -66,6 +66,43 @@ else:
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_CONFIG = {
+    "synchronous_mode": True,
+    "no_rendering_mode": True,
+    "yaw_sign": 1.0,
+    "yaw_offset_deg": 0.0,
+    "carla_connect_timeout_seconds": 40,
+    "retry_interval_seconds": 2,
+    "disable_scenario_runner_ego_control": True,
+    "scenario_runner_tm_seed": 0,
+    "kinematic_speed_deadband_mps": 0.02,
+    "kinematic_acceleration_deadband_mps2": 0.15,
+    "kinematic_yaw_rate_deadband_radps": 0.003,
+    "kinematic_yaw_acceleration_deadband_radps2": 0.1,
+    "ackermann_use_native_control": False,
+    "ackermann_native_speed_kp": 0.10,
+    "ackermann_native_speed_ki": 0.0,
+    "ackermann_native_speed_kd": 0.10,
+    "ackermann_native_accel_kp": 0.01,
+    "ackermann_native_accel_ki": 0.0,
+    "ackermann_native_accel_kd": 0.0,
+    "ackermann_speed_kp": 0.5,
+    "ackermann_min_throttle": 0.2,
+    "ackermann_max_throttle": 0.75,
+    "ackermann_stop_speed_threshold": 0.25,
+    "ackermann_launch_speed_threshold": 0.1,
+    "ackermann_launch_target_threshold": 0.25,
+    "ackermann_launch_throttle": 0.45,
+    "ackermann_brake_kp": 0.6,
+    "ackermann_min_brake": 0.15,
+    "ackermann_max_brake": 1.0,
+    "ackermann_accel_default": 1.5,
+    "ackermann_decel_default": 4.0,
+    "ackermann_jerk_default": 0.0,
+    "ackermann_brake_jerk_default": 8.0,
+}
+
+
 _VEHICLE_TYPE_BY_BLUEPRINT_ID = {
     "vehicle.audi.a2": RoadObjectType.CAR,
     "vehicle.audi.etron": RoadObjectType.CAR,
@@ -185,10 +222,10 @@ class CarlaAdapter:
 
         self._fixed_delta_seconds = request.dt
 
-        self._sync = bool(self.config.get("synchronous_mode", True))
-        self._no_rendering = bool(self.config.get("no_rendering_mode", False))
-        self._yaw_sign = float(self.config.get("yaw_sign", 1.0))
-        self._yaw_offset_deg = float(self.config.get("yaw_offset_deg", 0.0))
+        self._sync = bool(self._config_value("synchronous_mode"))
+        self._no_rendering = bool(self._config_value("no_rendering_mode"))
+        self._yaw_sign = float(self._config_value("yaw_sign"))
+        self._yaw_offset_deg = float(self._config_value("yaw_offset_deg"))
 
         self._max_steer_rad: float | None = None
         self._last_applied_control = None
@@ -200,12 +237,12 @@ class CarlaAdapter:
 
         self._spawned_actor_ids: set[int] = set()
         self._disable_sr_ego_control = bool(
-            self.config.get("disable_scenario_runner_ego_control", True)
+            self._config_value("disable_scenario_runner_ego_control")
         )
         self._sr_ego_control_ticks = 0
 
         self._scenario_runner_tm_port = int(os.environ.get("CARLA_TM_PORT", 8000))
-        self._scenario_runner_tm_seed = int(self.config.get("scenario_runner_tm_seed", 0))
+        self._scenario_runner_tm_seed = int(self._config_value("scenario_runner_tm_seed"))
 
         self._sr_scenario = None
         self._sr_tree = None
@@ -318,9 +355,11 @@ class CarlaAdapter:
             self._client.set_timeout(timeout)
             self._server_version = self._client.get_server_version()
         finally:
-            self._client.set_timeout(float(os.environ.get("CARLA_TIMEOUT", 10.0)))
-
+            self._client.set_timeout(float(os.environ.get("CARLA_TIMEOUT", 30.0)))
         logger.info("Connected to CARLA")
+
+    def _config_value(self, key: str):
+        return (self.config or {}).get(key, DEFAULT_CONFIG[key])
 
     def _to_carla_yaw(self, yaw_rad: float) -> float:
         return self._yaw_sign * math.degrees(yaw_rad) + self._yaw_offset_deg
@@ -351,8 +390,8 @@ class CarlaAdapter:
         self._external_control_prepared_actor_id = actor_id
 
     def _ensure_connected(self) -> bool:
-        timeout = self.config.get("carla_connect_timeout_seconds", 10)
-        retry_interval = self.config.get("retry_interval_seconds", 2)
+        timeout = self._config_value("carla_connect_timeout_seconds")
+        retry_interval = self._config_value("retry_interval_seconds")
 
         end_time = time.time() + timeout
 
@@ -411,7 +450,7 @@ class CarlaAdapter:
             # client timeout, but guarantee it gets restored even if
             # generation raises (otherwise every subsequent CARLA call
             # on this client inherits the inflated 300s timeout).
-            default_timeout = float(os.environ.get("CARLA_TIMEOUT", 10.0))
+            default_timeout = float(os.environ.get("CARLA_TIMEOUT", 30.0))
             self._client.set_timeout(300.0)
             try:
                 logger.info("Generating CARLA world from OpenDRIVE: %s", opendrive_path)
@@ -913,7 +952,7 @@ class CarlaAdapter:
         return float(acc.x * fwd.x + acc.y * fwd.y + acc.z * fwd.z)
 
     def _deadband_value(self, value: float, config_key: str) -> float:
-        threshold = abs(float((self.config or {}).get(config_key, 0.0)))
+        threshold = abs(float(self._config_value(config_key)))
         if threshold > 0.0 and abs(value) <= threshold:
             return 0.0
         return value
@@ -943,7 +982,7 @@ class CarlaAdapter:
 
     def _ackermann_current_speed(self) -> float:
         current_speed = self._get_forward_speed(self._ego_vehicle)
-        stop_threshold = float(self.config.get("ackermann_stop_speed_threshold", 0.05))
+        stop_threshold = float(self._config_value("ackermann_stop_speed_threshold"))
         if abs(current_speed) < stop_threshold:
             return 0.0
         return current_speed
@@ -952,20 +991,18 @@ class CarlaAdapter:
         self, target_speed: float
     ) -> tuple[float, float, float]:
         current_speed = self._ackermann_current_speed()
-        stop_threshold = float(self.config.get("ackermann_stop_speed_threshold", 0.05))
+        stop_threshold = float(self._config_value("ackermann_stop_speed_threshold"))
         speed_error = target_speed - current_speed
         if target_speed <= stop_threshold and current_speed > stop_threshold:
             return 0.0, 1.0, current_speed
 
         if speed_error > 0.0:
-            kp = float(self.config.get("ackermann_speed_kp", 0.35))
-            min_throttle = float(self.config.get("ackermann_min_throttle", 0.2))
-            max_throttle = float(self.config.get("ackermann_max_throttle", 0.75))
-            launch_speed_threshold = float(self.config.get("ackermann_launch_speed_threshold", 0.3))
-            launch_target_threshold = float(
-                self.config.get("ackermann_launch_target_threshold", 0.5)
-            )
-            launch_throttle = float(self.config.get("ackermann_launch_throttle", 0.45))
+            kp = float(self._config_value("ackermann_speed_kp"))
+            min_throttle = float(self._config_value("ackermann_min_throttle"))
+            max_throttle = float(self._config_value("ackermann_max_throttle"))
+            launch_speed_threshold = float(self._config_value("ackermann_launch_speed_threshold"))
+            launch_target_threshold = float(self._config_value("ackermann_launch_target_threshold"))
+            launch_throttle = float(self._config_value("ackermann_launch_throttle"))
 
             throttle = speed_error * kp
             if (
@@ -978,9 +1015,9 @@ class CarlaAdapter:
             return _clamp(throttle, 0.0, max_throttle), 0.0, current_speed
 
         if speed_error < 0.0:
-            brake_kp = float(self.config.get("ackermann_brake_kp", 0.6))
-            min_brake = float(self.config.get("ackermann_min_brake", 0.15))
-            max_brake = float(self.config.get("ackermann_max_brake", 0.8))
+            brake_kp = float(self._config_value("ackermann_brake_kp"))
+            min_brake = float(self._config_value("ackermann_min_brake"))
+            max_brake = float(self._config_value("ackermann_max_brake"))
 
             brake = max(-speed_error * brake_kp, min_brake)
             return 0.0, _clamp(brake, 0.0, max_brake), current_speed
@@ -989,12 +1026,12 @@ class CarlaAdapter:
 
     def _ackermann_controller_settings_payload(self) -> dict[str, float]:
         return {
-            "speed_kp": float(self.config.get("ackermann_native_speed_kp", 0.15)),
-            "speed_ki": float(self.config.get("ackermann_native_speed_ki", 0.0)),
-            "speed_kd": float(self.config.get("ackermann_native_speed_kd", 0.25)),
-            "accel_kp": float(self.config.get("ackermann_native_accel_kp", 0.01)),
-            "accel_ki": float(self.config.get("ackermann_native_accel_ki", 0.0)),
-            "accel_kd": float(self.config.get("ackermann_native_accel_kd", 0.01)),
+            "speed_kp": float(self._config_value("ackermann_native_speed_kp")),
+            "speed_ki": float(self._config_value("ackermann_native_speed_ki")),
+            "speed_kd": float(self._config_value("ackermann_native_speed_kd")),
+            "accel_kp": float(self._config_value("ackermann_native_accel_kp")),
+            "accel_ki": float(self._config_value("ackermann_native_accel_ki")),
+            "accel_kd": float(self._config_value("ackermann_native_accel_kd")),
         }
 
     def _apply_native_ackermann_controller_settings(self) -> dict[str, float]:
@@ -1365,29 +1402,29 @@ class CarlaAdapter:
             )
             target_speed = max(speed, 0.0)
             current_forward_speed = self._ackermann_current_speed()
-            stop_threshold = float(self.config.get("ackermann_stop_speed_threshold", 0.05))
+            stop_threshold = float(self._config_value("ackermann_stop_speed_threshold"))
             decelerating = target_speed < current_forward_speed - stop_threshold
 
             acceleration = payload.get("acceleration", None)
             if acceleration is None:
                 if decelerating:
-                    acceleration = -float(self.config.get("ackermann_decel_default", 4.0))
+                    acceleration = -float(self._config_value("ackermann_decel_default"))
                 else:
-                    acceleration = float(self.config.get("ackermann_accel_default", 1.5))
+                    acceleration = float(self._config_value("ackermann_accel_default"))
             else:
                 acceleration = float(acceleration)
             jerk = payload.get("jerk", None)
             if jerk is None:
                 if decelerating:
-                    jerk = float(self.config.get("ackermann_brake_jerk_default", 8.0))
+                    jerk = float(self._config_value("ackermann_brake_jerk_default"))
                 else:
-                    jerk = float(self.config.get("ackermann_jerk_default", 0.0))
+                    jerk = float(self._config_value("ackermann_jerk_default"))
             else:
                 jerk = float(jerk)
 
             if self._max_steer_rad:
                 steer = _clamp(steer, -self._max_steer_rad, self._max_steer_rad)
-            if bool(self.config.get("ackermann_use_native_control", False)):
+            if bool(self._config_value("ackermann_use_native_control")):
                 controller_settings = self._apply_native_ackermann_controller_settings()
                 control = carla.VehicleAckermannControl(
                     steer=steer,

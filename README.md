@@ -30,37 +30,61 @@ The wrapper expects these paths to be mounted in the container:
 Common config keys accepted by `InitRequest.config`:
 
 - `synchronous_mode`: Enables CARLA synchronous mode. Defaults to `true`.
-- `no_rendering_mode`: Enables CARLA no-rendering mode. Defaults to `false`.
+- `no_rendering_mode`: Enables CARLA no-rendering mode. Defaults to `true`.
 - `yaw_sign`: Coordinate yaw/sign convention multiplier. Defaults to `1.0`.
 - `yaw_offset_deg`: Coordinate yaw offset in degrees. Defaults to `0.0`.
 - `carla_connect_timeout_seconds`: Total CARLA connection retry window.
-  Defaults to `10`.
+  Defaults to `40`.
 - `retry_interval_seconds`: Delay between CARLA connection attempts. Defaults
   to `2`.
 - `disable_scenario_runner_ego_control`: Removes ScenarioRunner's ego
   controller before external control is applied. Defaults to `true`.
-- `scenario_runner_ego_control_ticks_before_disable`: Number of ScenarioRunner
-  ticks before disabling its ego controller. Defaults to `1`.
 - `scenario_runner_tm_seed`: TrafficManager random seed. Defaults to `0`.
-- `kinematic_speed_deadband_mps`,
-  `kinematic_acceleration_deadband_mps2`,
-  `kinematic_yaw_rate_deadband_radps`,
-  `kinematic_yaw_acceleration_deadband_radps2`: Clamp near-zero output
-  kinematic values to `0.0` before publishing runtime objects. Defaults to
-  `0.0`, which disables each deadband unless configured.
+- `kinematic_speed_deadband_mps`: Clamp near-zero speed values to `0.0`.
+  Defaults to `0.02`.
+- `kinematic_acceleration_deadband_mps2`: Clamp near-zero longitudinal
+  acceleration values to `0.0`. Defaults to `0.15`.
+- `kinematic_yaw_rate_deadband_radps`: Clamp near-zero yaw-rate values to
+  `0.0`. Defaults to `0.003`.
+- `kinematic_yaw_acceleration_deadband_radps2`: Clamp near-zero yaw
+  acceleration values to `0.0`. Defaults to `0.1`.
 - `ackermann_use_native_control`: Uses CARLA native Ackermann control when
   enabled. Defaults to `false`.
-- `ackermann_native_speed_kp`, `ackermann_native_speed_ki`,
-  `ackermann_native_speed_kd`, `ackermann_native_accel_kp`,
-  `ackermann_native_accel_ki`, `ackermann_native_accel_kd`,
-  `ackermann_speed_kp`, `ackermann_min_throttle`,
-  `ackermann_max_throttle`, `ackermann_stop_speed_threshold`,
-  `ackermann_launch_speed_threshold`, `ackermann_launch_target_threshold`,
-  `ackermann_launch_throttle`, `ackermann_brake_kp`,
-  `ackermann_min_brake`, `ackermann_max_brake`,
-  `ackermann_accel_default`, `ackermann_decel_default`,
-  `ackermann_jerk_default`, `ackermann_brake_jerk_default`: Parameters for
-  Ackermann native and fallback vehicle-control behavior.
+- `ackermann_native_speed_kp`: Native Ackermann speed PID proportional gain.
+  Defaults to `0.10`.
+- `ackermann_native_speed_ki`: Native Ackermann speed PID integral gain.
+  Defaults to `0.0`.
+- `ackermann_native_speed_kd`: Native Ackermann speed PID derivative gain.
+  Defaults to `0.10`.
+- `ackermann_native_accel_kp`: Native Ackermann acceleration PID proportional
+  gain. Defaults to `0.01`.
+- `ackermann_native_accel_ki`: Native Ackermann acceleration PID integral gain.
+  Defaults to `0.0`.
+- `ackermann_native_accel_kd`: Native Ackermann acceleration PID derivative
+  gain. Defaults to `0.0`.
+- `ackermann_speed_kp`: Fallback throttle proportional gain. Defaults to
+  `0.5`.
+- `ackermann_min_throttle`: Fallback minimum non-zero throttle. Defaults to
+  `0.2`.
+- `ackermann_max_throttle`: Fallback maximum throttle. Defaults to `0.75`.
+- `ackermann_stop_speed_threshold`: Speed treated as stopped, in m/s. Defaults
+  to `0.25`.
+- `ackermann_launch_speed_threshold`: Current speed below which launch throttle
+  can be used, in m/s. Defaults to `0.1`.
+- `ackermann_launch_target_threshold`: Target speed required for launch
+  throttle, in m/s. Defaults to `0.25`.
+- `ackermann_launch_throttle`: Fallback launch throttle. Defaults to `0.45`.
+- `ackermann_brake_kp`: Fallback brake proportional gain. Defaults to `0.6`.
+- `ackermann_min_brake`: Fallback minimum non-zero brake. Defaults to `0.15`.
+- `ackermann_max_brake`: Fallback maximum brake. Defaults to `1.0`.
+- `ackermann_accel_default`: Default Ackermann acceleration when omitted.
+  Defaults to `1.5`.
+- `ackermann_decel_default`: Default Ackermann deceleration magnitude when
+  omitted while slowing. Defaults to `4.0`.
+- `ackermann_jerk_default`: Default Ackermann jerk when omitted. Defaults to
+  `0.0`.
+- `ackermann_brake_jerk_default`: Default Ackermann jerk when omitted while
+  slowing. Defaults to `8.0`.
 
 ScenarioRunner is loaded through the container `PYTHONPATH`.
 

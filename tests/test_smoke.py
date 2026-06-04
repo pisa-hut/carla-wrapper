@@ -1,5 +1,6 @@
 """Smoke tests for the pisa-api simulator-friendly contract."""
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,34 @@ from pisa_api.simulator import (
     SimulatorTimeout,
     StepRequest,
 )
+
+
+def _parse_flat_example_config(path):
+    config = {}
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, raw_value = line.split(":", 1)
+        value = raw_value.strip()
+        if value == "true":
+            parsed_value = True
+        elif value == "false":
+            parsed_value = False
+        else:
+            parsed_value = float(value)
+            if parsed_value.is_integer() and "." not in value:
+                parsed_value = int(parsed_value)
+        config[key] = parsed_value
+    return config
+
+
+def test_default_config_matches_config_example() -> None:
+    from carla_wrapper import simulation
+
+    example_config = _parse_flat_example_config(Path(__file__).parents[1] / "config_example.yaml")
+
+    assert example_config == simulation.DEFAULT_CONFIG
 
 
 def test_public_imports_use_pisa_api_simulator_contract() -> None:
@@ -1272,7 +1301,7 @@ def test_kinematic_deadbands_clamp_near_zero_values() -> None:
     ) == (0.03, -0.2, 0.004, -0.2)
 
 
-def test_kinematic_deadbands_default_to_disabled() -> None:
+def test_kinematic_deadbands_default_to_config_example_values() -> None:
     from carla_wrapper import simulation
 
     adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
@@ -1283,7 +1312,7 @@ def test_kinematic_deadbands_default_to_disabled() -> None:
         acceleration=-0.12,
         yaw_rate=0.002,
         yaw_acceleration=-0.08,
-    ) == (0.01, -0.12, 0.002, -0.08)
+    ) == (0.0, 0.0, 0.0, 0.0)
 
 
 def test_ackermann_native_backend_applies_controller_settings_once(monkeypatch) -> None:
