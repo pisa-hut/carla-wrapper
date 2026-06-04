@@ -30,8 +30,8 @@ The wrapper expects these paths to be mounted in the container:
 Common config keys accepted by `InitRequest.config`:
 
 - `synchronous_mode`: Enables CARLA synchronous mode. Defaults to `true`.
-- `no_rendering_mode`: Enables CARLA no-rendering mode. Defaults to `false`.
-- `yaw_sign`: Coordinate yaw/sign convention multiplier. Defaults to `1.0`.
+- `no_rendering_mode`: Enables CARLA no-rendering mode. Defaults to `true`.
+- `yaw_sign`: Coordinate yaw/sign convention multiplier. Defaults to `-1.0`.
 - `yaw_offset_deg`: Coordinate yaw offset in degrees. Defaults to `0.0`.
 - `carla_connect_timeout_seconds`: Total CARLA connection retry window.
   Defaults to `10`.

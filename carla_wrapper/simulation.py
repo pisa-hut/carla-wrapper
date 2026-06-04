@@ -66,6 +66,43 @@ else:
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_CONFIG = {
+    "synchronous_mode": True,
+    "no_rendering_mode": True,
+    "yaw_sign": -1.0,
+    "yaw_offset_deg": 0.0,
+    "carla_connect_timeout_seconds": 40,
+    "retry_interval_seconds": 2,
+    "disable_scenario_runner_ego_control": True,
+    "scenario_runner_tm_seed": 0,
+    "kinematic_speed_deadband_mps": 0.02,
+    "kinematic_acceleration_deadband_mps2": 0.15,
+    "kinematic_yaw_rate_deadband_radps": 0.003,
+    "kinematic_yaw_acceleration_deadband_radps2": 0.1,
+    "ackermann_use_native_control": False,
+    "ackermann_native_speed_kp": 0.10,
+    "ackermann_native_speed_ki": 0.0,
+    "ackermann_native_speed_kd": 0.10,
+    "ackermann_native_accel_kp": 0.01,
+    "ackermann_native_accel_ki": 0.0,
+    "ackermann_native_accel_kd": 0.0,
+    "ackermann_speed_kp": 0.5,
+    "ackermann_min_throttle": 0.2,
+    "ackermann_max_throttle": 0.75,
+    "ackermann_stop_speed_threshold": 0.25,
+    "ackermann_launch_speed_threshold": 0.1,
+    "ackermann_launch_target_threshold": 0.25,
+    "ackermann_launch_throttle": 0.45,
+    "ackermann_brake_kp": 0.6,
+    "ackermann_min_brake": 0.15,
+    "ackermann_max_brake": 1.0,
+    "ackermann_accel_default": 1.5,
+    "ackermann_decel_default": 4.0,
+    "ackermann_jerk_default": 0.0,
+    "ackermann_brake_jerk_default": 8.0,
+}
+
+
 _VEHICLE_TYPE_BY_BLUEPRINT_ID = {
     "vehicle.audi.a2": RoadObjectType.CAR,
     "vehicle.audi.etron": RoadObjectType.CAR,
