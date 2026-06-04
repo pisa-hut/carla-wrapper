@@ -69,7 +69,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONFIG = {
     "synchronous_mode": True,
     "no_rendering_mode": True,
-    "yaw_sign": 1.0,
+    "yaw_sign": -1.0,
     "yaw_offset_deg": 0.0,
     "carla_connect_timeout_seconds": 40,
     "retry_interval_seconds": 2,

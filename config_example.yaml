@@ -22,7 +22,7 @@ no_rendering_mode: true
 # Multiplier applied to lateral/yaw-related values when converting between the
 # external simulator API convention and CARLA. Keep 1.0 unless your caller uses
 # the opposite Y/yaw convention.
-yaw_sign: 1.0
+yaw_sign: -1.0
 
 # Constant yaw offset, in degrees, applied during heading conversion.
 # Keep 0.0 unless integrating with a coordinate frame that has a fixed heading
