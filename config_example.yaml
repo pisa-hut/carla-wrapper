@@ -41,15 +41,6 @@ carla_connect_timeout_seconds: 40
 retry_interval_seconds: 2
 
 # -----------------------------------------------------------------------------
-# ScenarioRunner control ownership
-# -----------------------------------------------------------------------------
-
-# Remove ScenarioRunner's controller for the ego vehicle before applying
-# external ControlCommand input. This avoids ScenarioRunner and the wrapper both
-# writing ego control in the same tick.
-disable_scenario_runner_ego_control: true
-
-# -----------------------------------------------------------------------------
 # TrafficManager
 # -----------------------------------------------------------------------------
 

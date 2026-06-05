@@ -37,10 +37,6 @@ Common config keys accepted by `InitRequest.config`:
   Defaults to `10`.
 - `retry_interval_seconds`: Delay between CARLA connection attempts. Defaults
   to `2`.
-- `disable_scenario_runner_ego_control`: Removes ScenarioRunner's ego
-  controller before external control is applied. Defaults to `true`.
-- `scenario_runner_ego_control_ticks_before_disable`: Number of ScenarioRunner
-  ticks before disabling its ego controller. Defaults to `1`.
 - `scenario_runner_tm_seed`: TrafficManager random seed. Defaults to `0`.
 - `kinematic_speed_deadband_mps`,
   `kinematic_acceleration_deadband_mps2`,
