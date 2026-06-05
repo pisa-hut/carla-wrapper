@@ -297,14 +297,6 @@ class CarlaAdapter:
                     self._world.tick()
                 response = ResetResponse(frame=self._collect_runtime_frame())
             success = True
-            print(f"ego init speed: {response.frame.objects[0].kinematic.speed} m/s")
-            print(
-                f"ego init x: {response.frame.objects[0].kinematic.x}, y: {response.frame.objects[0].kinematic.y}"
-            )
-            print(f"agent init speed: {response.frame.objects[1].kinematic.speed} m/s")
-            print(
-                f"agent init x: {response.frame.objects[1].kinematic.x}, y: {response.frame.objects[1].kinematic.y}"
-            )
             return response
         finally:
             if not success:
