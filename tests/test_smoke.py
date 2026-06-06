@@ -406,6 +406,7 @@ def test_open_scenario_reset_delegates_world_loading_to_scenario_runner(tmp_path
     adapter.scenario = SimpleNamespace(format="open_scenario1")
     adapter._sync = False
     ego_vehicle = _FakeKinematicActor(11)
+    other_vehicle = _FakeKinematicActor(12)
     adapter._ego_vehicle = ego_vehicle
     adapter._clear_collision_events = lambda: calls.append("clear_collision_events")
     adapter._ensure_world = lambda scenario_pack, generate_opendrive_world=True: calls.append(
@@ -431,12 +432,14 @@ def test_open_scenario_reset_delegates_world_loading_to_scenario_runner(tmp_path
     adapter._sr_scenario = SimpleNamespace(
         config=SimpleNamespace(
             ego_vehicles=[SimpleNamespace(rolename="ego", speed=5.0)],
-            other_actors=[],
+            other_actors=[SimpleNamespace(rolename="agent1", speed=3.0)],
         ),
-        ego_vehicles=[SimpleNamespace(id=11, attributes={"role_name": "ego"})],
-        other_actors=[],
+        ego_vehicles=[ego_vehicle],
+        other_actors=[other_vehicle],
     )
-    adapter._world = _FakeRuntimeWorld([ego_vehicle], frame=10, elapsed_seconds=0.1)
+    ego_vehicle.attributes = {"role_name": "ego"}
+    other_vehicle.attributes = {"role_name": "agent1"}
+    adapter._world = _FakeRuntimeWorld([ego_vehicle, other_vehicle], frame=10, elapsed_seconds=0.1)
     adapter._objects_by_id = {}
     adapter._prev_yaw_rate = {}
     adapter._last_object_index_by_actor_id = {}
@@ -454,8 +457,9 @@ def test_open_scenario_reset_delegates_world_loading_to_scenario_runner(tmp_path
     assert calls.index("start_scenario_runner") < calls.index("start_recorder")
     assert calls.index("start_recorder") < calls.index("setup_collision_sensor")
     assert "tick_scenario_runner" not in calls
-    assert ("collect_runtime_frame", {11: 5.0}) in calls
+    assert ("collect_runtime_frame", {11: 5.0, 12: 3.0}) in calls
     assert ego_vehicle.set_velocity_calls == [SimpleNamespace(x=5.0, y=0.0, z=0.0)]
+    assert other_vehicle.set_velocity_calls == []
     adapter._world.frame = 11
     adapter._world.elapsed_seconds = 0.3
     ego_vehicle.forward_speed = 8.0

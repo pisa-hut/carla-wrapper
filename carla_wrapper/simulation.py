@@ -1220,8 +1220,7 @@ class CarlaAdapter:
             return
 
         try:
-            transform = self._ego_vehicle.get_transform()
-            forward = transform.get_forward_vector()
+            forward = self._ego_vehicle.get_transform().get_forward_vector()
             velocity = carla.Vector3D(
                 x=float(forward.x) * float(speed),
                 y=float(forward.y) * float(speed),
