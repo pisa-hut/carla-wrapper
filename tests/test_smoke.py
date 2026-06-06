@@ -35,7 +35,7 @@ def test_step_ticks_scenario_runner_then_world() -> None:
     adapter._sync = True
     adapter._tick_scenario_runner_module = lambda: calls.append("scenario_runner")
     adapter._ego_vehicle = SimpleNamespace(
-        apply_control=lambda control: calls.append(("control", control))
+        apply_control=lambda control: calls.append(("control", control)),
     )
     adapter._yaw_sign = 1.0
     adapter._collect_runtime_frame = lambda: RuntimeFrameData()
@@ -393,15 +393,20 @@ def test_reset_finalizes_partial_state_on_failure(tmp_path) -> None:
 
 
 def test_open_scenario_reset_delegates_world_loading_to_scenario_runner(tmp_path) -> None:
-    from carla_wrapper.simulation import CarlaAdapter
+    from carla_wrapper import simulation
 
     calls = []
-    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    simulation.carla = SimpleNamespace(
+        VehicleControl=_FakeVehicleControl,
+        Vector3D=lambda x, y, z: SimpleNamespace(x=x, y=y, z=z),
+    )
+    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
     adapter._finalized = True
     adapter._output_base = tmp_path
     adapter.scenario = SimpleNamespace(format="open_scenario1")
     adapter._sync = False
-    adapter._ego_vehicle = object()
+    ego_vehicle = _FakeKinematicActor(11)
+    adapter._ego_vehicle = ego_vehicle
     adapter._clear_collision_events = lambda: calls.append("clear_collision_events")
     adapter._ensure_world = lambda scenario_pack, generate_opendrive_world=True: calls.append(
         ("ensure_world", generate_opendrive_world)
@@ -414,19 +419,14 @@ def test_open_scenario_reset_delegates_world_loading_to_scenario_runner(tmp_path
     )
     adapter._setup_collision_sensor = lambda: calls.append("setup_collision_sensor")
     adapter._tick_scenario_runner_module = lambda: calls.append("tick_scenario_runner")
-    adapter._collect_runtime_frame = lambda speed_overrides=None: (
+    adapter._collect_collision_infos = lambda: []
+    original_collect_runtime_frame = adapter._collect_runtime_frame
+
+    def collect_runtime_frame(speed_overrides=None):
         calls.append(("collect_runtime_frame", speed_overrides))
-        or RuntimeFrameData(
-            objects=[
-                SimpleNamespace(
-                    kinematic=SimpleNamespace(speed=5.0, x=1.0, y=2.0),
-                ),
-                SimpleNamespace(
-                    kinematic=SimpleNamespace(speed=3.0, x=4.0, y=5.0),
-                ),
-            ]
-        )
-    )
+        return original_collect_runtime_frame(speed_overrides=speed_overrides)
+
+    adapter._collect_runtime_frame = collect_runtime_frame
     adapter._finalize = lambda: calls.append("finalize")
     adapter._sr_scenario = SimpleNamespace(
         config=SimpleNamespace(
@@ -436,6 +436,14 @@ def test_open_scenario_reset_delegates_world_loading_to_scenario_runner(tmp_path
         ego_vehicles=[SimpleNamespace(id=11, attributes={"role_name": "ego"})],
         other_actors=[],
     )
+    adapter._world = _FakeRuntimeWorld([ego_vehicle], frame=10, elapsed_seconds=0.1)
+    adapter._objects_by_id = {}
+    adapter._prev_yaw_rate = {}
+    adapter._last_object_index_by_actor_id = {}
+    adapter._last_applied_control = None
+    adapter._yaw_sign = 1.0
+    adapter._yaw_offset_deg = 0.0
+    adapter.config = {}
 
     request = SimpleNamespace(output_dir="run", scenario_pack=object(), params={})
 
@@ -447,6 +455,21 @@ def test_open_scenario_reset_delegates_world_loading_to_scenario_runner(tmp_path
     assert calls.index("start_recorder") < calls.index("setup_collision_sensor")
     assert "tick_scenario_runner" not in calls
     assert ("collect_runtime_frame", {11: 5.0}) in calls
+    assert ego_vehicle.set_velocity_calls == [SimpleNamespace(x=5.0, y=0.0, z=0.0)]
+    adapter._world.frame = 11
+    adapter._world.elapsed_seconds = 0.3
+    ego_vehicle.forward_speed = 8.0
+    step_frame = adapter._collect_runtime_frame()
+    assert step_frame.objects[0].kinematic.acceleration == pytest.approx(15.0)
+    assert step_frame.objects[0].kinematic.speed == pytest.approx(8.0)
+    assert adapter._initial_speed_acceleration_pending is False
+
+    adapter._world.frame = 12
+    adapter._world.elapsed_seconds = 0.35
+    ego_vehicle.forward_speed = 9.0
+    ego_vehicle.forward_accel = 0.7
+    next_frame = adapter._collect_runtime_frame()
+    assert next_frame.objects[0].kinematic.acceleration == pytest.approx(0.7)
     assert isinstance(response.frame, RuntimeFrameData)
 
 
@@ -835,13 +858,16 @@ class _FakeKinematicActor:
         self.x = x
         self.y = y
         self.z = z
+        self.forward_speed = 1.0
+        self.forward_accel = 0.0
         self.bounding_box = SimpleNamespace(extent=SimpleNamespace(x=2.0, y=1.0, z=0.75))
+        self.set_velocity_calls = []
 
     def get_velocity(self):
-        return SimpleNamespace(x=1.0, y=0.0, z=0.0)
+        return SimpleNamespace(x=self.forward_speed, y=0.0, z=0.0)
 
     def get_acceleration(self):
-        return SimpleNamespace(x=0.0, y=0.0, z=0.0)
+        return SimpleNamespace(x=self.forward_accel, y=0.0, z=0.0)
 
     def get_angular_velocity(self):
         return SimpleNamespace(z=0.0)
@@ -852,6 +878,12 @@ class _FakeKinematicActor:
             rotation=SimpleNamespace(yaw=0.0),
             get_forward_vector=lambda: SimpleNamespace(x=1.0, y=0.0, z=0.0),
         )
+
+    def set_simulate_physics(self, enabled):
+        self.simulate_physics_enabled = enabled
+
+    def set_velocity(self, velocity):
+        self.set_velocity_calls.append(velocity)
 
 
 class _FakeTrafficManager:
@@ -933,6 +965,39 @@ class _FakeClient:
     def generate_opendrive_world(self, *args, **kwargs):
         self.generated = True
         raise AssertionError("generate_opendrive_world should not be called")
+
+
+def test_first_post_reset_control_suppresses_brake_once(monkeypatch) -> None:
+    from carla_wrapper import simulation
+
+    monkeypatch.setattr(
+        simulation,
+        "carla",
+        SimpleNamespace(VehicleControl=_FakeVehicleControl),
+    )
+    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
+    adapter._ego_vehicle = _FakeVehicle()
+    adapter._world = _FakeWorld([])
+    adapter._sync = True
+    adapter._tick_scenario_runner_module = lambda: None
+    adapter._collect_runtime_frame = lambda: RuntimeFrameData()
+    adapter._yaw_sign = 1.0
+    adapter._last_applied_control = None
+    adapter._initial_velocity_brake_suppression_pending = True
+
+    ctrl = ControlCommand(
+        mode=ControlMode.THROTTLE_STEER_BREAK,
+        payload={"throttle": 0.0, "brake": 0.3, "steer": 0.2},
+    )
+    adapter.step(StepRequest(ctrl_cmd=ctrl))
+
+    assert adapter._ego_vehicle.applied_control.brake == 0.0
+    assert adapter._ego_vehicle.applied_control.steer == 0.2
+    assert adapter._initial_velocity_brake_suppression_pending is False
+
+    adapter.step(StepRequest(ctrl_cmd=ctrl))
+
+    assert adapter._ego_vehicle.applied_control.brake == 0.3
 
 
 def test_ackermann_defaults_to_vehicle_control_backend(monkeypatch) -> None:

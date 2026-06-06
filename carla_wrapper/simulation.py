@@ -184,6 +184,9 @@ class CarlaAdapter:
         self._pre_scenario_actor_ids: set[int] | None = None
         self._episode_start_carla_time_ns: int | None = None
         self._episode_start_carla_frame: int | None = None
+        self._initial_speed_acceleration_pending = False
+        self._initial_velocity_brake_suppression_pending = False
+        self._initial_speed_overrides: dict[int, float] = {}
         self._quit_msg = ""
 
         self._server_log_path = "/mnt/output/carla_server"
@@ -264,6 +267,7 @@ class CarlaAdapter:
             self._clear_collision_events()
             self._pre_scenario_actor_ids = None
             self._sr_last_tick_timestamp = None
+            self._clear_post_reset_initialization_state()
 
             scenario_format = self.scenario.format
             use_scenario_runner_world_loading = scenario_format == "open_scenario1"
@@ -286,16 +290,21 @@ class CarlaAdapter:
             self._reset_episode_clock()
             self._setup_collision_sensor()
             if use_scenario_runner_world_loading:
+                speed_overrides = self._open_scenario_initial_speed_overrides()
+                self._apply_ego_initial_speed(speed_overrides)
                 response = ResetResponse(
-                    frame=self._collect_runtime_frame(
-                        speed_overrides=self._open_scenario_initial_speed_overrides()
-                    )
+                    frame=self._collect_runtime_frame(speed_overrides=speed_overrides)
                 )
+                self._initial_speed_overrides = speed_overrides
+                self._initial_speed_acceleration_pending = bool(speed_overrides)
+                ego_id = getattr(self._ego_vehicle, "id", None)
+                self._initial_velocity_brake_suppression_pending = ego_id in speed_overrides
             else:
                 self._tick_scenario_runner_module()
                 if self._sync:
                     self._world.tick()
                 response = ResetResponse(frame=self._collect_runtime_frame())
+                self._clear_post_reset_initialization_state()
             success = True
             return response
         finally:
@@ -313,6 +322,7 @@ class CarlaAdapter:
             self._world.tick()
         else:
             self._world.wait_for_tick()
+        self._initial_velocity_brake_suppression_pending = False
         return StepResponse(frame=self._collect_runtime_frame())
 
     def stop(self) -> None:
@@ -1007,9 +1017,15 @@ class CarlaAdapter:
         self,
         speed_overrides: dict[int, float] | None = None,
     ) -> RuntimeFrameData:
+        clear_initial_acceleration_state = speed_overrides is None and getattr(
+            self, "_initial_speed_acceleration_pending", False
+        )
         objects, sim_time_ns, carla_frame, carla_time_ns = self._collect_objects(
             speed_overrides=speed_overrides
         )
+        if clear_initial_acceleration_state:
+            self._initial_speed_acceleration_pending = False
+            self._initial_speed_overrides = {}
         collisions = self._collect_collision_infos()
 
         extras_payload = {
@@ -1090,16 +1106,22 @@ class CarlaAdapter:
             ang = actor.get_angular_velocity()
 
             yaw = self._from_carla_yaw(float(transform.rotation.yaw))
-            speed = self._get_forward_speed(actor)
+            collected_speed = self._get_forward_speed(actor)
+            speed = collected_speed
             if speed_overrides and actor.id in speed_overrides:
                 speed = speed_overrides[actor.id]
             accel = self._get_forward_accel(actor)
             yaw_rate = math.radians(float(ang.z)) * self._yaw_sign
 
             prev_rate = self._prev_yaw_rate.get(actor.id, yaw_rate)
-            dt_s = 0.0
-            if self._time_ns > 0 and sim_time_ns > self._time_ns:
-                dt_s = (sim_time_ns - self._time_ns) / 1e9
+            dt_s = max(0.0, (sim_time_ns - self._time_ns) / 1e9)
+            if (
+                getattr(self, "_initial_speed_acceleration_pending", False)
+                and actor.id in getattr(self, "_initial_speed_overrides", {})
+                and dt_s > 0.0
+            ):
+                init_speed = self._initial_speed_overrides[actor.id]
+                accel = (collected_speed - init_speed) / dt_s
             yaw_acc = (yaw_rate - prev_rate) / dt_s if dt_s > 0 else 0.0
             self._prev_yaw_rate[actor.id] = yaw_rate
             speed, accel, yaw_rate, yaw_acc = self._apply_kinematic_deadbands(
@@ -1188,6 +1210,34 @@ class CarlaAdapter:
             for role_name, speed in speed_by_role.items()
             if role_name in actor_ids_by_role
         }
+
+    def _apply_ego_initial_speed(self, speed_overrides: dict[int, float]) -> None:
+        if self._ego_vehicle is None or carla is None:
+            return
+
+        speed = speed_overrides.get(int(self._ego_vehicle.id))
+        if speed is None:
+            return
+
+        try:
+            transform = self._ego_vehicle.get_transform()
+            forward = transform.get_forward_vector()
+            velocity = carla.Vector3D(
+                x=float(forward.x) * float(speed),
+                y=float(forward.y) * float(speed),
+                z=float(forward.z) * float(speed),
+            )
+            if hasattr(self._ego_vehicle, "set_velocity"):
+                self._ego_vehicle.set_velocity(velocity)
+            elif hasattr(self._ego_vehicle, "set_target_velocity"):
+                self._ego_vehicle.set_target_velocity(velocity)
+        except Exception:
+            logger.exception("Failed to seed initial speed for ego actor %s", self._ego_vehicle.id)
+
+    def _clear_post_reset_initialization_state(self) -> None:
+        self._initial_speed_acceleration_pending = False
+        self._initial_velocity_brake_suppression_pending = False
+        self._initial_speed_overrides = {}
 
     def _actor_sort_key(self, actor) -> tuple[float, float, float, int]:
         transform = actor.get_transform()
@@ -1327,6 +1377,8 @@ class CarlaAdapter:
         if ctrl.mode == ControlMode.THROTTLE_STEER_BREAK:
             throttle = _clamp(float(payload.get("throttle", 0.0)), 0.0, 1.0)
             brake = _clamp(float(payload.get("brake", 0.0)), 0.0, 1.0)
+            if getattr(self, "_initial_velocity_brake_suppression_pending", False):
+                brake = 0.0
             steer = _clamp(float(payload.get("steer", 0.0)), -1.0, 1.0)
             if brake > 0.0:
                 throttle = 0.0
@@ -1362,6 +1414,8 @@ class CarlaAdapter:
                     brake = _clamp(abs(pedal), 0.0, 1.0)
                 steer = _clamp(wheel, -1.0, 1.0)
 
+            if getattr(self, "_initial_velocity_brake_suppression_pending", False):
+                brake = 0.0
             if brake > 0.0:
                 throttle = 0.0
             control = carla.VehicleControl(
