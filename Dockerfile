@@ -31,7 +31,7 @@ ADD ${SRUNNER_GIT} /opt/scenario_runner
 # upstream srunner doesn't. Matrix sets WITH_CATALOGS=0 for :native.
 ARG WITH_CATALOGS=1
 RUN if [ "$WITH_CATALOGS" = "1" ]; then \
-        cp -r /opt/scenario_runner/srunner/examples/Catalogs /opt/Catalogs; \
+    cp -r /opt/scenario_runner/srunner/examples/Catalogs /opt/Catalogs; \
     fi
 
 USER carla

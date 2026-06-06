@@ -25,15 +25,19 @@ def test_public_imports_use_pisa_api_simulator_contract() -> None:
     assert CarlaAdapter is not None
 
 
-def test_step_applies_external_control_after_scenario_runner_tick() -> None:
-    from carla_wrapper.simulation import CarlaAdapter
+def test_step_ticks_scenario_runner_then_world() -> None:
+    from carla_wrapper import simulation
 
     calls = []
-    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    simulation.carla = SimpleNamespace(VehicleControl=_FakeVehicleControl)
+    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
     adapter._world = _FakeWorld(calls)
     adapter._sync = True
     adapter._tick_scenario_runner_module = lambda: calls.append("scenario_runner")
-    adapter._apply_ctrl = lambda ctrl: calls.append(("control", ctrl))
+    adapter._ego_vehicle = SimpleNamespace(
+        apply_control=lambda control: calls.append(("control", control)),
+    )
+    adapter._yaw_sign = 1.0
     adapter._collect_runtime_frame = lambda: RuntimeFrameData()
 
     ctrl = ControlCommand(
@@ -43,7 +47,9 @@ def test_step_applies_external_control_after_scenario_runner_tick() -> None:
 
     response = adapter.step(StepRequest(ctrl_cmd=ctrl))
 
-    assert calls == ["scenario_runner", ("control", ctrl), "world_tick"]
+    assert calls[0] == "scenario_runner"
+    assert calls[1][0] == "control"
+    assert calls[2] == "world_tick"
     assert isinstance(response.frame, RuntimeFrameData)
 
 
@@ -58,86 +64,6 @@ def test_should_quit_returns_response_message() -> None:
 
     assert response.should_quit is True
     assert response.msg == "ScenarioRunner finished with status SUCCESS"
-
-
-def test_disable_scenario_runner_ego_control_removes_only_ego(monkeypatch) -> None:
-    from carla_wrapper import simulation
-
-    ego_controller = _FakeController()
-    target_controller = _FakeController()
-    blackboard = _FakeBlackboard(
-        {
-            1: ego_controller,
-            2: target_controller,
-        }
-    )
-    monkeypatch.setattr(
-        simulation,
-        "py_trees",
-        SimpleNamespace(blackboard=SimpleNamespace(Blackboard=lambda: blackboard)),
-    )
-    monkeypatch.setattr(
-        simulation,
-        "carla",
-        SimpleNamespace(VehicleControl=_FakeVehicleControl),
-    )
-
-    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
-    adapter._ego_vehicle = _FakeVehicle()
-    adapter._disable_sr_ego_control = True
-    adapter._last_applied_control = None
-
-    adapter._disable_scenario_runner_ego_control()
-
-    assert blackboard.actor_dict == {2: target_controller}
-    assert ego_controller.reset_calls == 1
-    assert target_controller.reset_calls == 0
-    assert adapter._ego_vehicle.applied_control is None
-    assert adapter._last_applied_control is None
-
-
-def test_scenario_runner_ego_control_is_disabled_after_first_tick(monkeypatch) -> None:
-    from carla_wrapper import simulation
-
-    calls = []
-    ego_controller = _FakeController()
-    blackboard = _FakeBlackboard({1: ego_controller})
-    monkeypatch.setattr(
-        simulation,
-        "py_trees",
-        SimpleNamespace(
-            blackboard=SimpleNamespace(Blackboard=lambda: blackboard),
-            common=SimpleNamespace(
-                Status=SimpleNamespace(RUNNING="RUNNING", FAILURE="FAILURE", INVALID="INVALID")
-            ),
-        ),
-    )
-    monkeypatch.setattr(
-        simulation,
-        "GameTime",
-        SimpleNamespace(on_carla_tick=lambda timestamp: calls.append("game_time")),
-    )
-    monkeypatch.setattr(
-        simulation,
-        "CarlaDataProvider",
-        SimpleNamespace(on_carla_tick=lambda: calls.append("data_provider")),
-    )
-
-    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
-    adapter._world = _FakeScenarioWorld()
-    adapter._sr_scenario = object()
-    adapter._sr_running = True
-    adapter._sr_tree = _FakeScenarioTree(calls)
-    adapter._ego_vehicle = SimpleNamespace(id=1)
-    adapter._disable_sr_ego_control = True
-    adapter._sr_ego_control_ticks = 0
-    adapter._quit_flag = False
-
-    adapter._tick_scenario_runner_module()
-
-    assert calls == ["game_time", "data_provider", "tree_tick"]
-    assert blackboard.actor_dict == {}
-    assert ego_controller.reset_calls == 1
 
 
 def test_scenario_runner_tree_ticks_once_per_world_timestamp(monkeypatch) -> None:
@@ -170,8 +96,6 @@ def test_scenario_runner_tree_ticks_once_per_world_timestamp(monkeypatch) -> Non
     adapter._sr_running = True
     adapter._sr_tree = _FakeScenarioTree(calls)
     adapter._ego_vehicle = SimpleNamespace(id=1)
-    adapter._disable_sr_ego_control = False
-    adapter._sr_ego_control_ticks = 0
     adapter._sr_last_tick_timestamp = None
     adapter._quit_flag = False
 
@@ -179,7 +103,6 @@ def test_scenario_runner_tree_ticks_once_per_world_timestamp(monkeypatch) -> Non
     adapter._tick_scenario_runner_module()
 
     assert calls == ["game_time", "data_provider", "tree_tick"]
-    assert adapter._sr_ego_control_ticks == 1
 
 
 def test_scenario_runner_completion_sets_quit_message(monkeypatch) -> None:
@@ -212,8 +135,6 @@ def test_scenario_runner_completion_sets_quit_message(monkeypatch) -> None:
     adapter._sr_running = True
     adapter._sr_tree = _FakeScenarioTree(calls, status="SUCCESS")
     adapter._ego_vehicle = SimpleNamespace(id=1)
-    adapter._disable_sr_ego_control = False
-    adapter._sr_ego_control_ticks = 0
     adapter._sr_last_tick_timestamp = None
     adapter._quit_flag = False
     adapter._quit_msg = ""
@@ -448,8 +369,6 @@ def test_reset_finalizes_partial_state_on_failure(tmp_path) -> None:
     adapter._finalized = True
     adapter._output_base = tmp_path
     adapter.scenario = SimpleNamespace(format="carla_lb_route")
-    adapter._sr_ego_control_ticks = 99
-    adapter._external_control_prepared_actor_id = 123
     adapter._clear_collision_events = lambda: calls.append("clear_collision_events")
     adapter._ensure_world = lambda scenario_pack, generate_opendrive_world=True: calls.append(
         ("ensure_world", scenario_pack, generate_opendrive_world)
@@ -459,8 +378,6 @@ def test_reset_finalizes_partial_state_on_failure(tmp_path) -> None:
     adapter._client = SimpleNamespace(start_recorder=lambda path: calls.append(("recorder", path)))
 
     def start_scenario_runner(scenario_pack, params):
-        assert adapter._sr_ego_control_ticks == 0
-        assert adapter._external_control_prepared_actor_id is None
         raise RuntimeError("scenario failed")
 
     adapter._start_scenario_runner = start_scenario_runner
@@ -476,15 +393,21 @@ def test_reset_finalizes_partial_state_on_failure(tmp_path) -> None:
 
 
 def test_open_scenario_reset_delegates_world_loading_to_scenario_runner(tmp_path) -> None:
-    from carla_wrapper.simulation import CarlaAdapter
+    from carla_wrapper import simulation
 
     calls = []
-    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    simulation.carla = SimpleNamespace(
+        VehicleControl=_FakeVehicleControl,
+        Vector3D=lambda x, y, z: SimpleNamespace(x=x, y=y, z=z),
+    )
+    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
     adapter._finalized = True
     adapter._output_base = tmp_path
     adapter.scenario = SimpleNamespace(format="open_scenario1")
     adapter._sync = False
-    adapter._ego_vehicle = object()
+    ego_vehicle = _FakeKinematicActor(11)
+    other_vehicle = _FakeKinematicActor(12)
+    adapter._ego_vehicle = ego_vehicle
     adapter._clear_collision_events = lambda: calls.append("clear_collision_events")
     adapter._ensure_world = lambda scenario_pack, generate_opendrive_world=True: calls.append(
         ("ensure_world", generate_opendrive_world)
@@ -497,8 +420,33 @@ def test_open_scenario_reset_delegates_world_loading_to_scenario_runner(tmp_path
     )
     adapter._setup_collision_sensor = lambda: calls.append("setup_collision_sensor")
     adapter._tick_scenario_runner_module = lambda: calls.append("tick_scenario_runner")
-    adapter._collect_runtime_frame = lambda: RuntimeFrameData()
+    adapter._collect_collision_infos = lambda: []
+    original_collect_runtime_frame = adapter._collect_runtime_frame
+
+    def collect_runtime_frame(speed_overrides=None):
+        calls.append(("collect_runtime_frame", speed_overrides))
+        return original_collect_runtime_frame(speed_overrides=speed_overrides)
+
+    adapter._collect_runtime_frame = collect_runtime_frame
     adapter._finalize = lambda: calls.append("finalize")
+    adapter._sr_scenario = SimpleNamespace(
+        config=SimpleNamespace(
+            ego_vehicles=[SimpleNamespace(rolename="ego", speed=5.0)],
+            other_actors=[SimpleNamespace(rolename="agent1", speed=3.0)],
+        ),
+        ego_vehicles=[ego_vehicle],
+        other_actors=[other_vehicle],
+    )
+    ego_vehicle.attributes = {"role_name": "ego"}
+    other_vehicle.attributes = {"role_name": "agent1"}
+    adapter._world = _FakeRuntimeWorld([ego_vehicle, other_vehicle], frame=10, elapsed_seconds=0.1)
+    adapter._objects_by_id = {}
+    adapter._prev_yaw_rate = {}
+    adapter._last_object_index_by_actor_id = {}
+    adapter._last_applied_control = None
+    adapter._yaw_sign = 1.0
+    adapter._yaw_offset_deg = 0.0
+    adapter.config = {}
 
     request = SimpleNamespace(output_dir="run", scenario_pack=object(), params={})
 
@@ -507,7 +455,25 @@ def test_open_scenario_reset_delegates_world_loading_to_scenario_runner(tmp_path
     assert ("ensure_world", False) in calls
     assert "apply_world_settings" not in calls
     assert calls.index("start_scenario_runner") < calls.index("start_recorder")
-    assert calls.index("start_recorder") < calls.index("tick_scenario_runner")
+    assert calls.index("start_recorder") < calls.index("setup_collision_sensor")
+    assert "tick_scenario_runner" not in calls
+    assert ("collect_runtime_frame", {11: 5.0, 12: 3.0}) in calls
+    assert ego_vehicle.set_velocity_calls == [SimpleNamespace(x=5.0, y=0.0, z=0.0)]
+    assert other_vehicle.set_velocity_calls == []
+    adapter._world.frame = 11
+    adapter._world.elapsed_seconds = 0.3
+    ego_vehicle.forward_speed = 8.0
+    step_frame = adapter._collect_runtime_frame()
+    assert step_frame.objects[0].kinematic.acceleration == pytest.approx(15.0)
+    assert step_frame.objects[0].kinematic.speed == pytest.approx(8.0)
+    assert adapter._initial_speed_acceleration_pending is False
+
+    adapter._world.frame = 12
+    adapter._world.elapsed_seconds = 0.35
+    ego_vehicle.forward_speed = 9.0
+    ego_vehicle.forward_accel = 0.7
+    next_frame = adapter._collect_runtime_frame()
+    assert next_frame.objects[0].kinematic.acceleration == pytest.approx(0.7)
     assert isinstance(response.frame, RuntimeFrameData)
 
 
@@ -896,13 +862,16 @@ class _FakeKinematicActor:
         self.x = x
         self.y = y
         self.z = z
+        self.forward_speed = 1.0
+        self.forward_accel = 0.0
         self.bounding_box = SimpleNamespace(extent=SimpleNamespace(x=2.0, y=1.0, z=0.75))
+        self.set_velocity_calls = []
 
     def get_velocity(self):
-        return SimpleNamespace(x=1.0, y=0.0, z=0.0)
+        return SimpleNamespace(x=self.forward_speed, y=0.0, z=0.0)
 
     def get_acceleration(self):
-        return SimpleNamespace(x=0.0, y=0.0, z=0.0)
+        return SimpleNamespace(x=self.forward_accel, y=0.0, z=0.0)
 
     def get_angular_velocity(self):
         return SimpleNamespace(z=0.0)
@@ -914,27 +883,11 @@ class _FakeKinematicActor:
             get_forward_vector=lambda: SimpleNamespace(x=1.0, y=0.0, z=0.0),
         )
 
+    def set_simulate_physics(self, enabled):
+        self.simulate_physics_enabled = enabled
 
-class _FakeBlackboard:
-    def __init__(self, actor_dict):
-        self.actor_dict = actor_dict
-
-    @property
-    def ActorsWithController(self):
-        return self.actor_dict
-
-    def set(self, name, value, overwrite=False):
-        assert name == "ActorsWithController"
-        assert overwrite is True
-        self.actor_dict = value
-
-
-class _FakeController:
-    def __init__(self):
-        self.reset_calls = 0
-
-    def reset(self):
-        self.reset_calls += 1
+    def set_velocity(self, velocity):
+        self.set_velocity_calls.append(velocity)
 
 
 class _FakeTrafficManager:
@@ -1018,7 +971,7 @@ class _FakeClient:
         raise AssertionError("generate_opendrive_world should not be called")
 
 
-def test_vehicle_control_disables_autopilot_and_brake_overrides_throttle(monkeypatch) -> None:
+def test_first_post_reset_control_suppresses_brake_once(monkeypatch) -> None:
     from carla_wrapper import simulation
 
     monkeypatch.setattr(
@@ -1028,48 +981,27 @@ def test_vehicle_control_disables_autopilot_and_brake_overrides_throttle(monkeyp
     )
     adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
     adapter._ego_vehicle = _FakeVehicle()
-    adapter._scenario_runner_tm_port = 8000
+    adapter._world = _FakeWorld([])
+    adapter._sync = True
+    adapter._tick_scenario_runner_module = lambda: None
+    adapter._collect_runtime_frame = lambda: RuntimeFrameData()
     adapter._yaw_sign = 1.0
     adapter._last_applied_control = None
-    adapter._external_control_prepared_actor_id = None
-
-    adapter._apply_ctrl(
-        ControlCommand(
-            mode=ControlMode.THROTTLE_STEER_BREAK,
-            payload={"throttle": 1.0, "brake": 1.0, "steer": 0.25},
-        )
-    )
-
-    assert adapter._ego_vehicle.autopilot_calls == [(False, 8000)]
-    assert adapter._ego_vehicle.applied_control.throttle == 0.0
-    assert adapter._ego_vehicle.applied_control.brake == 1.0
-    assert adapter._ego_vehicle.applied_control.steer == 0.25
-
-
-def test_external_control_preparation_runs_once_per_actor(monkeypatch) -> None:
-    from carla_wrapper import simulation
-
-    monkeypatch.setattr(
-        simulation,
-        "carla",
-        SimpleNamespace(VehicleControl=_FakeVehicleControl),
-    )
-    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
-    adapter._ego_vehicle = _FakeVehicle()
-    adapter._scenario_runner_tm_port = 8000
-    adapter._yaw_sign = 1.0
-    adapter._last_applied_control = None
-    adapter._external_control_prepared_actor_id = None
+    adapter._initial_velocity_brake_suppression_pending = True
 
     ctrl = ControlCommand(
         mode=ControlMode.THROTTLE_STEER_BREAK,
-        payload={"throttle": 0.2, "brake": 0.0, "steer": 0.0},
+        payload={"throttle": 0.0, "brake": 0.3, "steer": 0.2},
     )
-    adapter._apply_ctrl(ctrl)
-    adapter._apply_ctrl(ctrl)
+    adapter.step(StepRequest(ctrl_cmd=ctrl))
 
-    assert adapter._ego_vehicle.autopilot_calls == [(False, 8000)]
-    assert adapter._ego_vehicle.simulate_physics_calls == [True]
+    assert adapter._ego_vehicle.applied_control.brake == 0.0
+    assert adapter._ego_vehicle.applied_control.steer == 0.2
+    assert adapter._initial_velocity_brake_suppression_pending is False
+
+    adapter.step(StepRequest(ctrl_cmd=ctrl))
+
+    assert adapter._ego_vehicle.applied_control.brake == 0.3
 
 
 def test_ackermann_defaults_to_vehicle_control_backend(monkeypatch) -> None:
@@ -1086,7 +1018,6 @@ def test_ackermann_defaults_to_vehicle_control_backend(monkeypatch) -> None:
     adapter._yaw_sign = 1.0
     adapter._max_steer_rad = 0.5
     adapter._last_applied_control = None
-    adapter._external_control_prepared_actor_id = None
     adapter.config = {"ackermann_speed_kp": 0.5}
 
     adapter._apply_ctrl(
@@ -1120,7 +1051,6 @@ def test_ackermann_vehicle_control_backend_uses_launch_throttle_from_stop(
     adapter._yaw_sign = 1.0
     adapter._max_steer_rad = None
     adapter._last_applied_control = None
-    adapter._external_control_prepared_actor_id = None
     adapter.config = {
         "ackermann_speed_kp": 0.1,
         "ackermann_min_throttle": 0.25,
@@ -1153,7 +1083,6 @@ def test_ackermann_vehicle_control_backend_uses_brake_gain(monkeypatch) -> None:
     adapter._yaw_sign = 1.0
     adapter._max_steer_rad = None
     adapter._last_applied_control = None
-    adapter._external_control_prepared_actor_id = None
     adapter.config = {
         "ackermann_brake_kp": 0.25,
         "ackermann_min_brake": 0.15,
@@ -1189,7 +1118,6 @@ def test_ackermann_native_backend_uses_decel_defaults_when_slowing(monkeypatch) 
     adapter._yaw_sign = 1.0
     adapter._max_steer_rad = None
     adapter._last_applied_control = None
-    adapter._external_control_prepared_actor_id = None
     adapter._native_ackermann_settings_actor_id = None
     adapter._native_ackermann_settings_payload = None
     adapter.config = {
@@ -1229,8 +1157,6 @@ def test_native_ackermann_handoff_does_not_apply_raw_vehicle_control(monkeypatch
     adapter._yaw_sign = 1.0
     adapter._max_steer_rad = None
     adapter._last_applied_control = None
-    adapter._external_control_prepared_actor_id = None
-    adapter._disable_sr_ego_control = False
     adapter._native_ackermann_settings_actor_id = None
     adapter._native_ackermann_settings_payload = None
     adapter.config = {"ackermann_use_native_control": True}
@@ -1303,7 +1229,6 @@ def test_ackermann_native_backend_applies_controller_settings_once(monkeypatch) 
     adapter._yaw_sign = 1.0
     adapter._max_steer_rad = None
     adapter._last_applied_control = None
-    adapter._external_control_prepared_actor_id = None
     adapter._native_ackermann_settings_actor_id = None
     adapter._native_ackermann_settings_payload = None
     adapter.config = {
