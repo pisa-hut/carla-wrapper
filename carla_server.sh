@@ -3,7 +3,6 @@
 pushd /opt/carla
 CMD=(
     "./CarlaUE4.sh"
-    "-nullrhi"
     "-RenderOffScreen"
     "-nosound"
     "-carla-port=${CARLA_PORT:-2000}"
