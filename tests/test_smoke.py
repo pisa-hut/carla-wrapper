@@ -151,6 +151,7 @@ def test_finalize_destroys_collision_sensor_before_scenario_runner_cleanup() -> 
 
     calls = []
     adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._record = True
     adapter._client = SimpleNamespace(stop_recorder=lambda: calls.append("stop_recorder"))
     adapter._destroy_spawned_actors = lambda: calls.append("destroy_spawned_actors")
     adapter._stop_scenario_runner_module = lambda: calls.append("stop_scenario_runner")
@@ -172,6 +173,7 @@ def test_finalize_continues_after_recorder_stop_failure() -> None:
 
     calls = []
     adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._record = True
     adapter._client = SimpleNamespace(
         stop_recorder=lambda: (_ for _ in ()).throw(RuntimeError("recorder failed"))
     )
@@ -186,6 +188,23 @@ def test_finalize_continues_after_recorder_stop_failure() -> None:
         "stop_scenario_runner",
         "clear_dynamic_actors",
     ]
+    assert adapter._finalized is True
+
+
+def test_finalize_skips_recorder_when_record_disabled() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    calls = []
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._record = False
+    adapter._client = SimpleNamespace(stop_recorder=lambda: calls.append("stop_recorder"))
+    adapter._destroy_spawned_actors = lambda: calls.append("destroy_spawned_actors")
+    adapter._stop_scenario_runner_module = lambda: calls.append("stop_scenario_runner")
+    adapter._clear_dynamic_actors = lambda: calls.append("clear_dynamic_actors")
+
+    adapter._finalize()
+
+    assert "stop_recorder" not in calls
     assert adapter._finalized is True
 
 
@@ -414,6 +433,7 @@ def test_open_scenario_reset_delegates_world_loading_to_scenario_runner(tmp_path
     )
     adapter._clear_dynamic_actors = lambda: calls.append("clear_dynamic_actors")
     adapter._apply_world_settings = lambda: calls.append("apply_world_settings")
+    adapter._record = True
     adapter._client = SimpleNamespace(start_recorder=lambda path: calls.append("start_recorder"))
     adapter._start_scenario_runner = lambda scenario_pack, params: calls.append(
         "start_scenario_runner"
