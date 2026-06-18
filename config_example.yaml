@@ -15,6 +15,10 @@ synchronous_mode: true
 # Use true for faster headless runs when camera/display rendering is not needed.
 no_rendering_mode: true
 
+# Record the simulation to carla_recording.log via the CARLA recorder.
+# Set true to enable recording (writes carla_recording.log).
+record: false
+
 # -----------------------------------------------------------------------------
 # Coordinate convention
 # -----------------------------------------------------------------------------
