@@ -223,6 +223,7 @@ class CarlaAdapter:
 
         self._sync = bool(self.config.get("synchronous_mode", True))
         self._no_rendering = bool(self.config.get("no_rendering_mode", False))
+        self._record = bool(self.config.get("record", False))
         self._yaw_sign = float(self.config.get("yaw_sign", 1.0))
         self._yaw_offset_deg = float(self.config.get("yaw_offset_deg", 0.0))
 
@@ -281,8 +282,9 @@ class CarlaAdapter:
 
             logger.info("Starting ScenarioRunner...")
             self._start_scenario_runner(request.scenario_pack, request.params)
-            p = str((self._output_dir / "carla_recording.log").resolve())
-            self._client.start_recorder(p)
+            if self._record:
+                p = str((self._output_dir / "carla_recording.log").resolve())
+                self._client.start_recorder(p)
 
             if self._ego_vehicle is None:
                 logger.warning("Ego vehicle not found after starting ScenarioRunner")
@@ -335,7 +337,7 @@ class CarlaAdapter:
         logger.info("CARLA simulator stopped.")
 
     def _finalize(self):
-        if self._client is not None:
+        if self._client is not None and getattr(self, "_record", False):
             try:
                 self._client.stop_recorder()
             except Exception:
