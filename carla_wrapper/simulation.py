@@ -252,9 +252,9 @@ class CarlaAdapter:
         self._record = bool(self._config_value("record"))
         self._yaw_sign = float(self._config_value("yaw_sign"))
         self._yaw_offset_deg = float(self._config_value("yaw_offset_deg"))
-        self._open_scenario_map_loader = str(
-            self._config_value("open_scenario_map_loader")
-        ).strip().lower()
+        self._open_scenario_map_loader = (
+            str(self._config_value("open_scenario_map_loader")).strip().lower()
+        )
         if self._open_scenario_map_loader not in _OPEN_SCENARIO_MAP_LOADERS:
             choices = ", ".join(sorted(_OPEN_SCENARIO_MAP_LOADERS))
             raise InvalidSimulatorRequest(
@@ -309,8 +309,7 @@ class CarlaAdapter:
             scenario_format = self.scenario.format
             is_open_scenario = scenario_format == "open_scenario1"
             use_scenario_runner_world_loading = is_open_scenario and (
-                getattr(self, "_open_scenario_map_loader", "scenario_runner")
-                == "scenario_runner"
+                getattr(self, "_open_scenario_map_loader", "scenario_runner") == "scenario_runner"
             )
             self._ensure_world(
                 request.scenario_pack,
