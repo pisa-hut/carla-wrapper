@@ -31,10 +31,20 @@ Common config keys accepted by `InitRequest.config`:
 
 - `synchronous_mode`: Enables CARLA synchronous mode. Defaults to `true`.
 - `no_rendering_mode`: Enables CARLA no-rendering mode. Defaults to `true`.
+- `record`: Records each run to `carla_recording.log`. Defaults to `false`.
+- `open_scenario_map_loader`: Selects who prepares the map for `open_scenario1`.
+  `scenario_runner` (default) preserves ScenarioRunner's native loading flow.
+  `wrapper` generates `/mnt/map/xodr/<ScenarioPackData.map_name>.xodr` first with
+  `wall_height=0.0`; ScenarioRunner may verify the map but is prevented from
+  replacing the generated world. The OpenSCENARIO `LogicFile` must reference the
+  same OpenDRIVE content. Because `map_name` is only available on `ResetRequest`,
+  the first reset after each `init()` generates the map. Later resets reuse it
+  only when the current CARLA map is `OpenDriveMap` and its OpenDRIVE digest
+  still matches; otherwise the wrapper regenerates the requested map.
 - `yaw_sign`: Coordinate yaw/sign convention multiplier. Defaults to `-1.0`.
 - `yaw_offset_deg`: Coordinate yaw offset in degrees. Defaults to `0.0`.
 - `carla_connect_timeout_seconds`: Total CARLA connection retry window.
-  Defaults to `10`.
+  Defaults to `40`.
 - `retry_interval_seconds`: Delay between CARLA connection attempts. Defaults
   to `2`.
 - `scenario_runner_tm_seed`: TrafficManager random seed. Defaults to `0`.
@@ -42,8 +52,8 @@ Common config keys accepted by `InitRequest.config`:
   `kinematic_acceleration_deadband_mps2`,
   `kinematic_yaw_rate_deadband_radps`,
   `kinematic_yaw_acceleration_deadband_radps2`: Clamp near-zero output
-  kinematic values to `0.0` before publishing runtime objects. Defaults to
-  `0.0`, which disables each deadband unless configured.
+  kinematic values to `0.0` before publishing runtime objects. Defaults are
+  `0.02`, `0.15`, `0.003`, and `0.1`, respectively.
 - `ackermann_use_native_control`: Uses CARLA native Ackermann control when
   enabled. Defaults to `false`.
 - `ackermann_native_speed_kp`, `ackermann_native_speed_ki`,

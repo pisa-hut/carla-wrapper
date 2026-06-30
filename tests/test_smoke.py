@@ -1,5 +1,8 @@
 """Smoke tests for the pisa-api simulator-friendly contract."""
 
+import ast
+from io import StringIO
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +14,56 @@ from pisa_api.simulator import (
     SimulatorTimeout,
     StepRequest,
 )
+
+
+def _parse_flat_yaml_config(path: Path) -> dict[str, object]:
+    config = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        key, raw_value = (part.strip() for part in line.split(":", 1))
+        lowered = raw_value.lower()
+        if lowered in {"true", "false"}:
+            value = lowered == "true"
+        else:
+            try:
+                value = float(raw_value) if "." in raw_value else int(raw_value)
+            except ValueError:
+                value = raw_value.strip("'\"")
+        config[key] = value
+    return config
+
+
+def test_default_config_matches_config_example() -> None:
+    from carla_wrapper.simulation import DEFAULT_CONFIG
+
+    example_path = Path(__file__).parents[1] / "config_example.yaml"
+    example_config = _parse_flat_yaml_config(example_path)
+
+    assert example_config == DEFAULT_CONFIG
+    assert {key: type(value) for key, value in example_config.items()} == {
+        key: type(value) for key, value in DEFAULT_CONFIG.items()
+    }
+
+
+def test_every_default_config_key_is_used_by_runtime() -> None:
+    from carla_wrapper import simulation
+
+    tree = ast.parse(Path(simulation.__file__).read_text(encoding="utf-8"))
+    used_keys = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        key_arg = None
+        if node.func.attr == "_config_value" and node.args:
+            key_arg = node.args[0]
+        elif node.func.attr == "_deadband_value" and len(node.args) >= 2:
+            key_arg = node.args[1]
+        if isinstance(key_arg, ast.Constant) and isinstance(key_arg.value, str):
+            used_keys.add(key_arg.value)
+
+    assert used_keys == set(simulation.DEFAULT_CONFIG)
 
 
 def test_public_imports_use_pisa_api_simulator_contract() -> None:
@@ -259,6 +312,25 @@ def test_init_finalizes_previous_run_and_prepares_reused_server() -> None:
     adapter.init(request)
 
     assert calls == ["finalize", "prepare_reused_server"]
+    assert adapter._wrapper_loaded_opendrive_digest is None
+
+
+def test_init_rejects_unknown_open_scenario_map_loader() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._finalized = True
+    adapter._ensure_connected = lambda: True
+    adapter._prepare_reused_server_state = lambda: None
+    request = SimpleNamespace(
+        output_dir="out",
+        config={"open_scenario_map_loader": "unknown"},
+        scenario=SimpleNamespace(format="open_scenario1"),
+        dt=0.05,
+    )
+
+    with pytest.raises(InvalidSimulatorRequest, match="Invalid open_scenario_map_loader"):
+        adapter.init(request)
 
 
 def test_prepare_reused_server_forces_async_and_clears_dynamic_actors() -> None:
@@ -411,6 +483,38 @@ def test_reset_finalizes_partial_state_on_failure(tmp_path) -> None:
     assert calls[1][0] == "ensure_world"
 
 
+def test_open_scenario_wrapper_map_loader_generates_world_before_scenario_runner(tmp_path) -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    calls = []
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._finalized = True
+    adapter._output_base = tmp_path
+    adapter.scenario = SimpleNamespace(format="open_scenario1")
+    adapter._open_scenario_map_loader = "wrapper"
+    adapter._clear_collision_events = lambda: None
+    adapter._ensure_world = lambda scenario_pack, generate_opendrive_world=True: calls.append(
+        ("ensure_world", generate_opendrive_world)
+    )
+    adapter._clear_dynamic_actors = lambda: calls.append("clear_dynamic_actors")
+    adapter._apply_world_settings = lambda: calls.append("apply_world_settings")
+    adapter._start_scenario_runner = lambda scenario_pack, params: (_ for _ in ()).throw(
+        RuntimeError("stop after map preparation")
+    )
+    adapter._finalize = lambda: calls.append("finalize")
+    request = SimpleNamespace(output_dir="run", scenario_pack=object(), params={})
+
+    with pytest.raises(RuntimeError, match="stop after map preparation"):
+        adapter.reset(request)
+
+    assert calls[:3] == [
+        ("ensure_world", True),
+        "clear_dynamic_actors",
+        "apply_world_settings",
+    ]
+    assert calls[-1] == "finalize"
+
+
 def test_open_scenario_reset_delegates_world_loading_to_scenario_runner(tmp_path) -> None:
     from carla_wrapper import simulation
 
@@ -511,6 +615,136 @@ def test_ensure_world_can_skip_opendrive_generation() -> None:
     assert adapter._client.generated is False
 
 
+def test_ensure_world_generates_opendrive_without_walls(monkeypatch) -> None:
+    from carla_wrapper import simulation
+
+    generated_world = object()
+    generation_parameters = []
+
+    class FakeGenerationParameters:
+        def __init__(self, **kwargs):
+            generation_parameters.append(kwargs)
+
+    class FakeClient:
+        def __init__(self):
+            self.timeouts = []
+
+        def set_timeout(self, timeout):
+            self.timeouts.append(timeout)
+
+        def generate_opendrive_world(self, opendrive, parameters):
+            assert opendrive == "<OpenDRIVE/>"
+            assert isinstance(parameters, FakeGenerationParameters)
+            return generated_world
+
+    monkeypatch.setattr(
+        simulation,
+        "carla",
+        SimpleNamespace(OpendriveGenerationParameters=FakeGenerationParameters),
+    )
+    monkeypatch.setattr(simulation.Path, "exists", lambda self: True)
+    monkeypatch.setattr("builtins.open", lambda *args, **kwargs: StringIO("<OpenDRIVE/>"))
+    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
+    adapter._server_version = "test"
+    adapter._client = FakeClient()
+
+    adapter._ensure_world(SimpleNamespace(map_name="test_map"))
+
+    assert adapter._world is generated_world
+    assert generation_parameters[0]["wall_height"] == 0.0
+    assert adapter._client.timeouts == [300.0, 30.0]
+    assert adapter._wrapper_loaded_opendrive_digest == adapter._opendrive_digest("<OpenDRIVE/>")
+
+
+def test_ensure_world_reuses_verified_wrapper_generated_opendrive(monkeypatch) -> None:
+    from carla_wrapper import simulation
+
+    opendrive = "<?xml version='1.0'?>\n<OpenDRIVE><road id='1'/></OpenDRIVE>"
+
+    class FakeMap:
+        name = "/Game/Carla/Maps/OpenDriveMap"
+
+        def to_opendrive(self):
+            return opendrive[opendrive.index("<OpenDRIVE") :]
+
+    world = SimpleNamespace(get_map=lambda: FakeMap())
+
+    class FakeClient:
+        def __init__(self):
+            self.generate_calls = 0
+
+        def get_world(self):
+            return world
+
+        def generate_opendrive_world(self, *_args):
+            self.generate_calls += 1
+            return world
+
+    monkeypatch.setattr(simulation.Path, "exists", lambda self: True)
+    monkeypatch.setattr("builtins.open", lambda *args, **kwargs: StringIO(opendrive))
+    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
+    adapter._server_version = "test"
+    adapter._client = FakeClient()
+    adapter._wrapper_loaded_opendrive_digest = adapter._opendrive_digest(opendrive)
+
+    adapter._ensure_world(SimpleNamespace(map_name="map_a"))
+
+    assert adapter._world is world
+    assert adapter._client.generate_calls == 0
+
+
+def test_ensure_world_switches_between_different_opendrive_maps_with_same_carla_name(
+    monkeypatch,
+) -> None:
+    from carla_wrapper import simulation
+
+    old_opendrive = "<OpenDRIVE><road id='old'/></OpenDRIVE>"
+    new_opendrive = "<OpenDRIVE><road id='new'/></OpenDRIVE>"
+    generated_world = object()
+
+    class FakeMap:
+        name = "/Game/Carla/Maps/OpenDriveMap"
+
+        def to_opendrive(self):
+            return old_opendrive
+
+    old_world = SimpleNamespace(get_map=lambda: FakeMap())
+
+    class FakeClient:
+        def __init__(self):
+            self.generate_calls = 0
+            self.timeouts = []
+
+        def get_world(self):
+            return old_world
+
+        def set_timeout(self, timeout):
+            self.timeouts.append(timeout)
+
+        def generate_opendrive_world(self, opendrive, _parameters):
+            self.generate_calls += 1
+            assert opendrive == new_opendrive
+            return generated_world
+
+    monkeypatch.setattr(
+        simulation,
+        "carla",
+        SimpleNamespace(OpendriveGenerationParameters=lambda **kwargs: kwargs),
+    )
+    monkeypatch.setattr(simulation.Path, "exists", lambda self: True)
+    monkeypatch.setattr("builtins.open", lambda *args, **kwargs: StringIO(new_opendrive))
+    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
+    adapter._server_version = "test"
+    adapter._client = FakeClient()
+    adapter._wrapper_loaded_opendrive_digest = adapter._opendrive_digest(old_opendrive)
+
+    adapter._ensure_world(SimpleNamespace(map_name="map_b"))
+
+    assert adapter._world is generated_world
+    assert adapter._client.generate_calls == 1
+    assert adapter._wrapper_loaded_opendrive_digest == adapter._opendrive_digest(new_opendrive)
+
+
 def test_ensure_world_requires_scenario_pack() -> None:
     from carla_wrapper.simulation import CarlaAdapter
 
@@ -558,6 +792,23 @@ def test_open_scenario_missing_xosc_fails_before_scenario_runner(monkeypatch) ->
 
     with pytest.raises(InvalidSimulatorRequest, match="OpenSCENARIO file not found"):
         adapter._start_scenario_runner_module(SimpleNamespace(name="missing"), {})
+
+
+def test_wrapper_map_loader_prevents_scenario_runner_from_replacing_world(monkeypatch) -> None:
+    from carla_wrapper import simulation
+
+    class FakeOpenScenarioConfiguration:
+        def __init__(self, filename, client, params):
+            client.generate_opendrive_world("different map")
+
+    monkeypatch.setattr(simulation, "OpenScenarioConfiguration", FakeOpenScenarioConfiguration)
+    monkeypatch.setattr(simulation.Path, "exists", lambda self: True)
+    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
+    adapter._client = SimpleNamespace(generate_opendrive_world=lambda *args: object())
+    adapter._open_scenario_map_loader = "wrapper"
+
+    with pytest.raises(InvalidSimulatorRequest, match="tried to replace"):
+        adapter._prepare_open_scenario_config(SimpleNamespace(name="scenario"), {})
 
 
 def test_open_scenario_uses_scenario_runner_reloaded_world(monkeypatch) -> None:
@@ -1218,11 +1469,30 @@ def test_kinematic_deadbands_clamp_near_zero_values() -> None:
     ) == (0.03, -0.2, 0.004, -0.2)
 
 
-def test_kinematic_deadbands_default_to_disabled() -> None:
+def test_kinematic_deadbands_use_default_config_values() -> None:
     from carla_wrapper import simulation
 
     adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
     adapter.config = {}
+
+    assert adapter._apply_kinematic_deadbands(
+        speed=0.01,
+        acceleration=-0.12,
+        yaw_rate=0.002,
+        yaw_acceleration=-0.08,
+    ) == (0.0, 0.0, 0.0, 0.0)
+
+
+def test_kinematic_deadbands_can_be_disabled_explicitly() -> None:
+    from carla_wrapper import simulation
+
+    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
+    adapter.config = {
+        "kinematic_speed_deadband_mps": 0.0,
+        "kinematic_acceleration_deadband_mps2": 0.0,
+        "kinematic_yaw_rate_deadband_radps": 0.0,
+        "kinematic_yaw_acceleration_deadband_radps2": 0.0,
+    }
 
     assert adapter._apply_kinematic_deadbands(
         speed=0.01,

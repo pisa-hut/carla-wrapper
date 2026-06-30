@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import math
 import os
@@ -69,6 +70,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONFIG = {
     "synchronous_mode": True,
     "no_rendering_mode": True,
+    "record": False,
+    "open_scenario_map_loader": "scenario_runner",
     "yaw_sign": -1.0,
     "yaw_offset_deg": 0.0,
     "carla_connect_timeout_seconds": 40,
@@ -100,6 +103,29 @@ DEFAULT_CONFIG = {
     "ackermann_jerk_default": 0.0,
     "ackermann_brake_jerk_default": 8.0,
 }
+
+
+_OPEN_SCENARIO_MAP_LOADERS = {"scenario_runner", "wrapper"}
+
+
+class _WorldLoadingDisabledClient:
+    """Forward CARLA client calls while preventing ScenarioRunner world replacement."""
+
+    def __init__(self, client):
+        self._client = client
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+    def _world_loading_disabled(self, *_args, **_kwargs):
+        raise InvalidSimulatorRequest(
+            "ScenarioRunner tried to replace a wrapper-generated world; ensure the "
+            "OpenSCENARIO LogicFile uses the same OpenDRIVE map as ScenarioPack map_name"
+        )
+
+    generate_opendrive_world = _world_loading_disabled
+    load_world = _world_loading_disabled
+    reload_world = _world_loading_disabled
 
 
 _VEHICLE_TYPE_BY_BLUEPRINT_ID = {
@@ -221,11 +247,20 @@ class CarlaAdapter:
 
         self._fixed_delta_seconds = request.dt
 
-        self._sync = bool(self.config.get("synchronous_mode", True))
-        self._no_rendering = bool(self.config.get("no_rendering_mode", False))
-        self._record = bool(self.config.get("record", False))
-        self._yaw_sign = float(self.config.get("yaw_sign", 1.0))
-        self._yaw_offset_deg = float(self.config.get("yaw_offset_deg", 0.0))
+        self._sync = bool(self._config_value("synchronous_mode"))
+        self._no_rendering = bool(self._config_value("no_rendering_mode"))
+        self._record = bool(self._config_value("record"))
+        self._yaw_sign = float(self._config_value("yaw_sign"))
+        self._yaw_offset_deg = float(self._config_value("yaw_offset_deg"))
+        self._open_scenario_map_loader = str(
+            self._config_value("open_scenario_map_loader")
+        ).strip().lower()
+        if self._open_scenario_map_loader not in _OPEN_SCENARIO_MAP_LOADERS:
+            choices = ", ".join(sorted(_OPEN_SCENARIO_MAP_LOADERS))
+            raise InvalidSimulatorRequest(
+                f"Invalid open_scenario_map_loader '{self._open_scenario_map_loader}'; "
+                f"expected one of: {choices}"
+            )
 
         self._max_steer_rad: float | None = None
         self._last_applied_control = None
@@ -237,7 +272,7 @@ class CarlaAdapter:
         self._spawned_actor_ids: set[int] = set()
 
         self._scenario_runner_tm_port = int(os.environ.get("CARLA_TM_PORT", 8000))
-        self._scenario_runner_tm_seed = int(self.config.get("scenario_runner_tm_seed", 0))
+        self._scenario_runner_tm_seed = int(self._config_value("scenario_runner_tm_seed"))
 
         self._sr_scenario = None
         self._sr_tree = None
@@ -247,6 +282,7 @@ class CarlaAdapter:
         self._traffic_manager = None
         self._traffic_manager_sync_enabled = False
         self._pre_scenario_actor_ids = None
+        self._wrapper_loaded_opendrive_digest = None
         self._prepare_reused_server_state()
 
         return None
@@ -271,7 +307,11 @@ class CarlaAdapter:
             self._clear_post_reset_initialization_state()
 
             scenario_format = self.scenario.format
-            use_scenario_runner_world_loading = scenario_format == "open_scenario1"
+            is_open_scenario = scenario_format == "open_scenario1"
+            use_scenario_runner_world_loading = is_open_scenario and (
+                getattr(self, "_open_scenario_map_loader", "scenario_runner")
+                == "scenario_runner"
+            )
             self._ensure_world(
                 request.scenario_pack,
                 generate_opendrive_world=not use_scenario_runner_world_loading,
@@ -291,7 +331,7 @@ class CarlaAdapter:
 
             self._reset_episode_clock()
             self._setup_collision_sensor()
-            if use_scenario_runner_world_loading:
+            if is_open_scenario:
                 speed_overrides = self._open_scenario_initial_speed_overrides()
                 self._apply_ego_initial_speed(speed_overrides)
                 response = ResetResponse(
@@ -362,19 +402,22 @@ class CarlaAdapter:
             self._client.set_timeout(timeout)
             self._server_version = self._client.get_server_version()
         finally:
-            self._client.set_timeout(float(os.environ.get("CARLA_TIMEOUT", 10.0)))
+            self._client.set_timeout(float(os.environ.get("CARLA_TIMEOUT", 30.0)))
 
         logger.info("Connected to CARLA")
 
     def _to_carla_yaw(self, yaw_rad: float) -> float:
         return self._yaw_sign * math.degrees(yaw_rad) + self._yaw_offset_deg
 
+    def _config_value(self, key: str):
+        return (self.config or {}).get(key, DEFAULT_CONFIG[key])
+
     def _from_carla_yaw(self, yaw_deg: float) -> float:
         return math.radians((yaw_deg - self._yaw_offset_deg) * self._yaw_sign)
 
     def _ensure_connected(self) -> bool:
-        timeout = self.config.get("carla_connect_timeout_seconds", 10)
-        retry_interval = self.config.get("retry_interval_seconds", 2)
+        timeout = self._config_value("carla_connect_timeout_seconds")
+        retry_interval = self._config_value("retry_interval_seconds")
 
         end_time = time.time() + timeout
 
@@ -429,11 +472,20 @@ class CarlaAdapter:
 
             with open(opendrive_path, encoding="utf-8") as f:
                 opendrive_str = f.read()
+            opendrive_digest = self._opendrive_digest(opendrive_str)
+            world = self._matching_wrapper_generated_world(opendrive_digest)
+            if world is not None:
+                logger.info(
+                    "Reusing wrapper-generated OpenDRIVE world for map '%s'",
+                    opendrive_name,
+                )
+                self._world = world
+                return
             # OpenDRIVE world generation can take minutes — bump the
             # client timeout, but guarantee it gets restored even if
             # generation raises (otherwise every subsequent CARLA call
             # on this client inherits the inflated 300s timeout).
-            default_timeout = float(os.environ.get("CARLA_TIMEOUT", 10.0))
+            default_timeout = float(os.environ.get("CARLA_TIMEOUT", 30.0))
             self._client.set_timeout(300.0)
             try:
                 logger.info("Generating CARLA world from OpenDRIVE: %s", opendrive_path)
@@ -454,6 +506,7 @@ class CarlaAdapter:
                         f"Failed to generate CARLA world from OpenDRIVE map: {opendrive_name}"
                     ) from exc
                 logger.info("Generated CARLA world from OpenDRIVE: %s", opendrive_path)
+                self._wrapper_loaded_opendrive_digest = opendrive_digest
             finally:
                 self._client.set_timeout(default_timeout)
         else:
@@ -463,6 +516,33 @@ class CarlaAdapter:
             world = self._client.get_world()
 
         self._world = world
+
+    @staticmethod
+    def _opendrive_digest(opendrive: str) -> str:
+        start = opendrive.find("<OpenDRIVE")
+        if start < 0:
+            raise InvalidSimulatorRequest("OpenDRIVE content does not contain an OpenDRIVE root")
+        payload = opendrive[start:].encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _matching_wrapper_generated_world(self, expected_digest: str):
+        if getattr(self, "_wrapper_loaded_opendrive_digest", None) != expected_digest:
+            return None
+        if self._client is None:
+            return None
+
+        try:
+            world = self._client.get_world()
+            carla_map = world.get_map() if world is not None else None
+            map_name = carla_map.name.split("/")[-1] if carla_map is not None else None
+            if map_name != "OpenDriveMap":
+                return None
+            if self._opendrive_digest(carla_map.to_opendrive()) != expected_digest:
+                return None
+            return world
+        except Exception:
+            logger.exception("Failed to verify the current wrapper-generated OpenDRIVE world")
+            return None
 
     def _sync_world_from_scenario_runner(self) -> None:
         if self._client is None:
@@ -640,7 +720,10 @@ class CarlaAdapter:
         if not xosc_path.exists():
             raise InvalidSimulatorRequest(f"OpenSCENARIO file not found: {xosc_path}")
 
-        config = OpenScenarioConfiguration(str(xosc_path), self._client, openscenario_params)
+        config_client = self._client
+        if getattr(self, "_open_scenario_map_loader", "scenario_runner") == "wrapper":
+            config_client = _WorldLoadingDisabledClient(self._client)
+        config = OpenScenarioConfiguration(str(xosc_path), config_client, openscenario_params)
         self._load_and_wait_for_scenario_runner_world(config)
         CarlaDataProvider.set_world(self._world)
         return config, xosc_path
@@ -908,7 +991,7 @@ class CarlaAdapter:
         return float(acc.x * fwd.x + acc.y * fwd.y + acc.z * fwd.z)
 
     def _deadband_value(self, value: float, config_key: str) -> float:
-        threshold = abs(float((self.config or {}).get(config_key, 0.0)))
+        threshold = abs(float(self._config_value(config_key)))
         if threshold > 0.0 and abs(value) <= threshold:
             return 0.0
         return value
@@ -938,7 +1021,7 @@ class CarlaAdapter:
 
     def _ackermann_current_speed(self) -> float:
         current_speed = self._get_forward_speed(self._ego_vehicle)
-        stop_threshold = float(self.config.get("ackermann_stop_speed_threshold", 0.05))
+        stop_threshold = float(self._config_value("ackermann_stop_speed_threshold"))
         if abs(current_speed) < stop_threshold:
             return 0.0
         return current_speed
@@ -947,20 +1030,18 @@ class CarlaAdapter:
         self, target_speed: float
     ) -> tuple[float, float, float]:
         current_speed = self._ackermann_current_speed()
-        stop_threshold = float(self.config.get("ackermann_stop_speed_threshold", 0.05))
+        stop_threshold = float(self._config_value("ackermann_stop_speed_threshold"))
         speed_error = target_speed - current_speed
         if target_speed <= stop_threshold and current_speed > stop_threshold:
             return 0.0, 1.0, current_speed
 
         if speed_error > 0.0:
-            kp = float(self.config.get("ackermann_speed_kp", 0.35))
-            min_throttle = float(self.config.get("ackermann_min_throttle", 0.2))
-            max_throttle = float(self.config.get("ackermann_max_throttle", 0.75))
-            launch_speed_threshold = float(self.config.get("ackermann_launch_speed_threshold", 0.3))
-            launch_target_threshold = float(
-                self.config.get("ackermann_launch_target_threshold", 0.5)
-            )
-            launch_throttle = float(self.config.get("ackermann_launch_throttle", 0.45))
+            kp = float(self._config_value("ackermann_speed_kp"))
+            min_throttle = float(self._config_value("ackermann_min_throttle"))
+            max_throttle = float(self._config_value("ackermann_max_throttle"))
+            launch_speed_threshold = float(self._config_value("ackermann_launch_speed_threshold"))
+            launch_target_threshold = float(self._config_value("ackermann_launch_target_threshold"))
+            launch_throttle = float(self._config_value("ackermann_launch_throttle"))
 
             throttle = speed_error * kp
             if (
@@ -973,9 +1054,9 @@ class CarlaAdapter:
             return _clamp(throttle, 0.0, max_throttle), 0.0, current_speed
 
         if speed_error < 0.0:
-            brake_kp = float(self.config.get("ackermann_brake_kp", 0.6))
-            min_brake = float(self.config.get("ackermann_min_brake", 0.15))
-            max_brake = float(self.config.get("ackermann_max_brake", 0.8))
+            brake_kp = float(self._config_value("ackermann_brake_kp"))
+            min_brake = float(self._config_value("ackermann_min_brake"))
+            max_brake = float(self._config_value("ackermann_max_brake"))
 
             brake = max(-speed_error * brake_kp, min_brake)
             return 0.0, _clamp(brake, 0.0, max_brake), current_speed
@@ -984,12 +1065,12 @@ class CarlaAdapter:
 
     def _ackermann_controller_settings_payload(self) -> dict[str, float]:
         return {
-            "speed_kp": float(self.config.get("ackermann_native_speed_kp", 0.15)),
-            "speed_ki": float(self.config.get("ackermann_native_speed_ki", 0.0)),
-            "speed_kd": float(self.config.get("ackermann_native_speed_kd", 0.25)),
-            "accel_kp": float(self.config.get("ackermann_native_accel_kp", 0.01)),
-            "accel_ki": float(self.config.get("ackermann_native_accel_ki", 0.0)),
-            "accel_kd": float(self.config.get("ackermann_native_accel_kd", 0.01)),
+            "speed_kp": float(self._config_value("ackermann_native_speed_kp")),
+            "speed_ki": float(self._config_value("ackermann_native_speed_ki")),
+            "speed_kd": float(self._config_value("ackermann_native_speed_kd")),
+            "accel_kp": float(self._config_value("ackermann_native_accel_kp")),
+            "accel_ki": float(self._config_value("ackermann_native_accel_ki")),
+            "accel_kd": float(self._config_value("ackermann_native_accel_kd")),
         }
 
     def _apply_native_ackermann_controller_settings(self) -> dict[str, float]:
@@ -1442,29 +1523,29 @@ class CarlaAdapter:
             )
             target_speed = max(speed, 0.0)
             current_forward_speed = self._ackermann_current_speed()
-            stop_threshold = float(self.config.get("ackermann_stop_speed_threshold", 0.05))
+            stop_threshold = float(self._config_value("ackermann_stop_speed_threshold"))
             decelerating = target_speed < current_forward_speed - stop_threshold
 
             acceleration = payload.get("acceleration", None)
             if acceleration is None:
                 if decelerating:
-                    acceleration = -float(self.config.get("ackermann_decel_default", 4.0))
+                    acceleration = -float(self._config_value("ackermann_decel_default"))
                 else:
-                    acceleration = float(self.config.get("ackermann_accel_default", 1.5))
+                    acceleration = float(self._config_value("ackermann_accel_default"))
             else:
                 acceleration = float(acceleration)
             jerk = payload.get("jerk", None)
             if jerk is None:
                 if decelerating:
-                    jerk = float(self.config.get("ackermann_brake_jerk_default", 8.0))
+                    jerk = float(self._config_value("ackermann_brake_jerk_default"))
                 else:
-                    jerk = float(self.config.get("ackermann_jerk_default", 0.0))
+                    jerk = float(self._config_value("ackermann_jerk_default"))
             else:
                 jerk = float(jerk)
 
             if self._max_steer_rad:
                 steer = _clamp(steer, -self._max_steer_rad, self._max_steer_rad)
-            if bool(self.config.get("ackermann_use_native_control", False)):
+            if bool(self._config_value("ackermann_use_native_control")):
                 controller_settings = self._apply_native_ackermann_controller_settings()
                 control = carla.VehicleAckermannControl(
                     steer=steer,
