@@ -10,6 +10,8 @@ from pathlib import Path
 from threading import Lock
 
 from pisa_api.simulator import (
+    ActorRefData,
+    ActorRole,
     CollisionInfoData,
     ControlCommand,
     ControlMode,
@@ -22,10 +24,13 @@ from pisa_api.simulator import (
     RoadObjectType,
     RuntimeFrameData,
     ScenarioPackData,
+    ShapeCenterPoseData,
     ShapeData,
     ShapeDimensionData,
     ShapeType,
     ShouldQuitResponse,
+    SimulatorEgoData,
+    SimulatorObjectData,
     SimulatorPreconditionFailed,
     SimulatorTimeout,
     SimulatorUnavailable,
@@ -193,10 +198,13 @@ class CarlaAdapter:
         self._finalized = True
         self._objects_by_id = {}
         self._prev_yaw_rate = {}
+        self._active_actor_ids: set[int] = set()
+        self._retired_actor_ids: set[int] = set()
+        self._actor_metadata_by_id: dict[int, tuple[str | None, ActorRole]] = {}
+        self._xosc_entity_names: set[str] = set()
         self._collision_sensor = None
         self._collision_events = deque()
         self._collision_lock = Lock()
-        self._last_object_index_by_actor_id: dict[int, int] = {}
         self._last_applied_control: dict | None = None
         self._quit_flag = False
         self._spawned_actor_ids: set[int] = set()
@@ -305,6 +313,7 @@ class CarlaAdapter:
             self._pre_scenario_actor_ids = None
             self._sr_last_tick_timestamp = None
             self._clear_post_reset_initialization_state()
+            self._reset_episode_identity()
 
             scenario_format = self.scenario.format
             is_open_scenario = scenario_format == "open_scenario1"
@@ -326,7 +335,9 @@ class CarlaAdapter:
                 self._client.start_recorder(p)
 
             if self._ego_vehicle is None:
-                logger.warning("Ego vehicle not found after starting ScenarioRunner")
+                raise SimulatorPreconditionFailed(
+                    "Ego vehicle not found after starting ScenarioRunner"
+                )
 
             self._reset_episode_clock()
             self._setup_collision_sensor()
@@ -651,7 +662,10 @@ class CarlaAdapter:
         spawned_actor_ids.clear()
         self._objects_by_id.clear()
         self._prev_yaw_rate.clear()
-        self._last_object_index_by_actor_id.clear()
+        getattr(self, "_active_actor_ids", set()).clear()
+        getattr(self, "_retired_actor_ids", set()).clear()
+        getattr(self, "_actor_metadata_by_id", {}).clear()
+        getattr(self, "_xosc_entity_names", set()).clear()
         self._clear_collision_events()
 
     def _is_dynamic_actor(self, actor) -> bool:
@@ -723,6 +737,17 @@ class CarlaAdapter:
         if getattr(self, "_open_scenario_map_loader", "scenario_runner") == "wrapper":
             config_client = _WorldLoadingDisabledClient(self._client)
         config = OpenScenarioConfiguration(str(xosc_path), config_client, openscenario_params)
+        configured_actors = list(getattr(config, "ego_vehicles", [])) + list(
+            getattr(config, "other_actors", [])
+        )
+        entity_names = [
+            str(actor.rolename)
+            for actor in configured_actors
+            if getattr(actor, "rolename", None) is not None
+        ]
+        if len(entity_names) != len(set(entity_names)):
+            raise InvalidSimulatorRequest("OpenSCENARIO ScenarioObject names must be unique")
+        self._xosc_entity_names = set(entity_names)
         self._load_and_wait_for_scenario_runner_world(config)
         CarlaDataProvider.set_world(self._world)
         return config, xosc_path
@@ -972,12 +997,79 @@ class CarlaAdapter:
                 y=float(bb.extent.y * 2.0),
                 z=float(bb.extent.z * 2.0),
             )
-            return ShapeData(type=ShapeType.BOUNDING_BOX, dimensions=dims)
-        except Exception:
+            location = getattr(bb, "location", None)
+            rotation = getattr(bb, "rotation", None)
+            center = ShapeCenterPoseData(
+                x=float(getattr(location, "x", 0.0)),
+                y=float(getattr(location, "y", 0.0)) * self._yaw_sign,
+                z=float(getattr(location, "z", 0.0)),
+                roll=math.radians(float(getattr(rotation, "roll", 0.0))),
+                pitch=math.radians(float(getattr(rotation, "pitch", 0.0))),
+                yaw=math.radians(float(getattr(rotation, "yaw", 0.0))) * self._yaw_sign,
+            )
             return ShapeData(
                 type=ShapeType.BOUNDING_BOX,
-                dimensions=ShapeDimensionData(x=0.0, y=0.0, z=0.0),
+                dimensions=dims,
+                center=center,
+                reference_point="carla_actor_origin",
             )
+        except Exception as exc:
+            raise SimulatorPreconditionFailed(
+                f"Failed to read bounding box for CARLA actor {getattr(actor, 'id', 'unknown')}"
+            ) from exc
+
+    def _reset_episode_identity(self) -> None:
+        self._objects_by_id = {}
+        self._prev_yaw_rate = {}
+        self._active_actor_ids = set()
+        self._retired_actor_ids = set()
+        self._actor_metadata_by_id = {}
+        self._xosc_entity_names = set()
+
+    def _entity_name_from_actor(self, actor) -> str | None:
+        role_name = getattr(actor, "attributes", {}).get("role_name")
+        if role_name is None:
+            return None
+        role_name = str(role_name)
+        if role_name not in getattr(self, "_xosc_entity_names", set()):
+            return None
+        return role_name
+
+    def _actor_role(self, actor_id: int) -> ActorRole:
+        ego_id = getattr(getattr(self, "_ego_vehicle", None), "id", None)
+        return ActorRole.EGO if actor_id == ego_id else ActorRole.AGENT
+
+    def _register_current_actor_ids(self, actors: list) -> None:
+        current_ids = {int(actor.id) for actor in actors}
+        active_ids = getattr(self, "_active_actor_ids", set())
+        retired_ids = getattr(self, "_retired_actor_ids", set())
+
+        reused_ids = (current_ids - active_ids) & retired_ids
+        if reused_ids:
+            reused = ", ".join(str(actor_id) for actor_id in sorted(reused_ids))
+            raise SimulatorPreconditionFailed(
+                f"CARLA reused retired actor ID(s) within one reset episode: {reused}"
+            )
+
+        retired_ids.update(active_ids - current_ids)
+        self._active_actor_ids = current_ids
+        self._retired_actor_ids = retired_ids
+
+    def _actor_ref(
+        self, actor_id: int | None, entity_name: str | None = None
+    ) -> ActorRefData | None:
+        if actor_id is None:
+            return None
+        actor_id = int(actor_id)
+        stored_name, stored_role = getattr(self, "_actor_metadata_by_id", {}).get(
+            actor_id,
+            (None, self._actor_role(actor_id)),
+        )
+        return ActorRefData(
+            tracking_id=actor_id,
+            entity_name=entity_name if entity_name is not None else stored_name,
+            role=stored_role,
+        )
 
     def _get_forward_speed(self, actor) -> float:
         vel = actor.get_velocity()
@@ -1102,7 +1194,7 @@ class CarlaAdapter:
         clear_initial_acceleration_state = speed_overrides is None and getattr(
             self, "_initial_speed_acceleration_pending", False
         )
-        objects, sim_time_ns, carla_frame, carla_time_ns = self._collect_objects(
+        ego, agents, sim_time_ns, carla_frame, carla_time_ns = self._collect_objects(
             speed_overrides=speed_overrides
         )
         if clear_initial_acceleration_state:
@@ -1114,10 +1206,6 @@ class CarlaAdapter:
             "carla_frame": carla_frame,
             "carla_time_ns": carla_time_ns,
             "episode_frame": self._episode_frame_from_carla_frame(carla_frame),
-            "object_index_by_actor_id": {
-                str(actor_id): index
-                for actor_id, index in self._last_object_index_by_actor_id.items()
-            },
             "collision_count": len(collisions),
             "untracked_collision_count": sum(
                 1 for collision in collisions if collision.actor_b is None
@@ -1130,7 +1218,8 @@ class CarlaAdapter:
 
         return RuntimeFrameData(
             sim_time_ns=sim_time_ns,
-            objects=objects,
+            ego=ego,
+            agents=agents,
             collision=collisions,
             extras=extras_payload,
         )
@@ -1161,27 +1250,33 @@ class CarlaAdapter:
     def _collect_objects(
         self,
         speed_overrides: dict[int, float] | None = None,
-    ) -> tuple[list[ObjectStateData], int, int, int]:
+    ) -> tuple[SimulatorEgoData, dict[int, SimulatorObjectData], int, int, int]:
         if self._world is None:
-            return [], 0, 0, 0
+            raise SimulatorUnavailable("CARLA world is not available")
+        if self._ego_vehicle is None:
+            raise SimulatorPreconditionFailed("CARLA ego vehicle is not available")
 
         snapshot = self._world.get_snapshot()
         carla_time_ns = int(snapshot.timestamp.elapsed_seconds * 1e9)
         sim_time_ns = self._episode_time_from_carla_time_ns(carla_time_ns)
         carla_frame = int(snapshot.frame)
 
-        actors = []
-        actors.extend(self._world.get_actors().filter("vehicle.*"))
-        actors.extend(self._world.get_actors().filter("walker.pedestrian.*"))
+        world_actors = self._world.get_actors()
+        actors_by_id = {
+            int(actor.id): actor
+            for actor in world_actors
+            if getattr(actor, "type_id", "").startswith(("vehicle.", "walker.pedestrian."))
+            or self._entity_name_from_actor(actor) is not None
+        }
+        actors_by_id[int(self._ego_vehicle.id)] = self._ego_vehicle
+        actors = list(actors_by_id.values())
+        self._register_current_actor_ids(actors)
 
-        actor_ids = {a.id for a in actors}
+        actor_ids = {int(actor.id) for actor in actors}
         for stale_id in list(self._objects_by_id.keys()):
             if stale_id not in actor_ids:
                 self._objects_by_id.pop(stale_id, None)
                 self._prev_yaw_rate.pop(stale_id, None)
-
-        objects: list[ObjectStateData] = []
-        ordered_actors = []
 
         def upsert(actor):
             transform = actor.get_transform()
@@ -1224,44 +1319,34 @@ class CarlaAdapter:
                 yaw_rate=float(yaw_rate),
                 yaw_acceleration=float(yaw_acc),
             )
-            obj = self._objects_by_id.get(actor.id)
-            if obj is None:
-                obj = ObjectStateData(
-                    type=self._actor_type(actor),
-                    kinematic=kin,
-                    shape=self._shape_from_actor(actor),
-                )
-            else:
-                obj = ObjectStateData(
-                    type=obj.type,
-                    kinematic=kin,
-                    shape=obj.shape,
-                )
+            previous = self._objects_by_id.get(actor.id)
+            state = ObjectStateData(
+                type=previous.state.type if previous is not None else self._actor_type(actor),
+                kinematic=kin,
+                shape=previous.state.shape
+                if previous is not None
+                else self._shape_from_actor(actor),
+            )
+            entity_name = self._entity_name_from_actor(actor)
+            obj = SimulatorObjectData(state=state, entity_name=entity_name)
             self._objects_by_id[actor.id] = obj
+            metadata = getattr(self, "_actor_metadata_by_id", {})
+            metadata[int(actor.id)] = (
+                entity_name,
+                self._actor_role(int(actor.id)),
+            )
+            self._actor_metadata_by_id = metadata
 
             return obj
 
-        if self._ego_vehicle is not None:
-            objects.append(upsert(self._ego_vehicle))
-            ordered_actors.append(self._ego_vehicle)
-
-        non_ego_actors = [
-            actor
-            for actor in actors
-            if self._ego_vehicle is None or actor.id != self._ego_vehicle.id
-        ]
-        for actor in sorted(non_ego_actors, key=self._actor_sort_key):
-            objects.append(upsert(actor))
-            ordered_actors.append(actor)
-
-        self._last_object_index_by_actor_id = {
-            actor.id: index for index, actor in enumerate(ordered_actors)
-        }
+        ego_id = int(self._ego_vehicle.id)
+        ego = SimulatorEgoData(tracking_id=ego_id, object=upsert(self._ego_vehicle))
+        agents = {int(actor.id): upsert(actor) for actor in actors if int(actor.id) != ego_id}
         self._time_ns = sim_time_ns
 
-        logger.debug("Collected %s objects at time %s ns", len(objects), sim_time_ns)
+        logger.debug("Collected ego and %s agents at time %s ns", len(agents), sim_time_ns)
 
-        return objects, sim_time_ns, carla_frame, carla_time_ns
+        return ego, agents, sim_time_ns, carla_frame, carla_time_ns
 
     def _open_scenario_initial_speed_overrides(self) -> dict[int, float]:
         scenario = getattr(self, "_sr_scenario", None)
@@ -1320,16 +1405,6 @@ class CarlaAdapter:
         self._initial_velocity_brake_suppression_pending = False
         self._initial_speed_overrides = {}
 
-    def _actor_sort_key(self, actor) -> tuple[float, float, float, int]:
-        transform = actor.get_transform()
-        location = transform.location
-        return (
-            float(location.x),
-            float(location.y) * self._yaw_sign,
-            float(location.z),
-            int(actor.id),
-        )
-
     def _setup_collision_sensor(self) -> None:
         self._destroy_collision_sensor()
         self._clear_collision_events()
@@ -1385,6 +1460,10 @@ class CarlaAdapter:
             "timestamp": float(getattr(event, "timestamp", 0.0)),
             "actor_id": int(actor.id) if actor is not None else None,
             "other_actor_id": int(other_actor.id) if other_actor is not None else None,
+            "actor_entity_name": self._entity_name_from_actor(actor) if actor is not None else None,
+            "other_actor_entity_name": (
+                self._entity_name_from_actor(other_actor) if other_actor is not None else None
+            ),
             "other_actor_type_id": getattr(other_actor, "type_id", ""),
             "other_actor_semantic_tags": list(getattr(other_actor, "semantic_tags", [])),
             "normal_impulse": {
@@ -1402,12 +1481,7 @@ class CarlaAdapter:
             self._collision_events.clear()
 
         collisions: list[CollisionInfoData] = []
-        ego_actor_id = self._ego_vehicle.id if self._ego_vehicle is not None else None
         for event in events:
-            actor_a_index = self._last_object_index_by_actor_id.get(event["actor_id"])
-            if actor_a_index is None and event["actor_id"] == ego_actor_id:
-                actor_a_index = 0
-            actor_b_index = self._last_object_index_by_actor_id.get(event["other_actor_id"])
             carla_timestamp_seconds = event["timestamp"]
             episode_time_ns = self._episode_time_from_carla_time_ns(
                 int(carla_timestamp_seconds * 1e9)
@@ -1439,8 +1513,10 @@ class CarlaAdapter:
             collisions.append(
                 CollisionInfoData(
                     occurred=True,
-                    actor_a=actor_a_index,
-                    actor_b=actor_b_index,
+                    actor_a=self._actor_ref(event["actor_id"], event.get("actor_entity_name")),
+                    actor_b=self._actor_ref(
+                        event["other_actor_id"], event.get("other_actor_entity_name")
+                    ),
                     details=details_payload,
                 )
             )

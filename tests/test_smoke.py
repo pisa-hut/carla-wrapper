@@ -1,16 +1,19 @@
 """Smoke tests for the pisa-api simulator-friendly contract."""
 
 import ast
+import math
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from pisa_api.simulator import (
+    ActorRole,
     ControlCommand,
     ControlMode,
     InvalidSimulatorRequest,
     RuntimeFrameData,
+    SimulatorPreconditionFailed,
     SimulatorTimeout,
     StepRequest,
 )
@@ -371,7 +374,6 @@ def test_runtime_frame_uses_reset_relative_time() -> None:
     adapter._prev_yaw_rate = {}
     adapter._collision_lock = _FakeLock()
     adapter._collision_events = []
-    adapter._last_object_index_by_actor_id = {}
     adapter._last_applied_control = None
     adapter._yaw_sign = 1.0
     adapter._yaw_offset_deg = 0.0
@@ -381,7 +383,9 @@ def test_runtime_frame_uses_reset_relative_time() -> None:
     frame = adapter._collect_runtime_frame()
 
     assert frame.sim_time_ns == 0
-    assert frame.objects[0].kinematic.time_ns == 0
+    assert frame.ego.tracking_id == 1
+    assert frame.ego.object.state.kinematic.time_ns == 0
+    assert frame.agents == {}
     assert frame.extras["carla_frame"] == 120
     assert frame.extras["carla_time_ns"] == 12_500_000_000
     assert frame.extras["episode_frame"] == 0
@@ -391,11 +395,11 @@ def test_runtime_frame_uses_reset_relative_time() -> None:
     frame = adapter._collect_runtime_frame()
 
     assert frame.sim_time_ns == 100_000_000
-    assert frame.objects[0].kinematic.time_ns == 100_000_000
+    assert frame.ego.object.state.kinematic.time_ns == 100_000_000
     assert frame.extras["episode_frame"] == 2
 
 
-def test_collect_objects_keeps_ego_first_and_sorts_other_actors_by_xy() -> None:
+def test_collect_objects_identity_is_independent_of_enumeration_order() -> None:
     from carla_wrapper.simulation import CarlaAdapter
 
     ego = _FakeKinematicActor(actor_id=1, x=10.0, y=10.0)
@@ -409,17 +413,93 @@ def test_collect_objects_keeps_ego_first_and_sorts_other_actors_by_xy() -> None:
     adapter._objects_by_id = {}
     adapter._prev_yaw_rate = {}
     adapter._time_ns = 0
-    adapter._last_object_index_by_actor_id = {}
     adapter._episode_start_carla_time_ns = 0
     adapter._yaw_sign = 1.0
     adapter._yaw_offset_deg = 0.0
     adapter.config = {}
 
-    objects, _, _, _ = adapter._collect_objects()
+    ego_frame, agents, _, _, _ = adapter._collect_objects()
+    assert ego_frame.tracking_id == 1
+    assert set(agents) == {2, 3, 4}
+    assert {actor_id: obj.state.kinematic.x for actor_id, obj in agents.items()} == {
+        2: 1.0,
+        3: 2.0,
+        4: 2.0,
+    }
+    refs_before_reorder = (adapter._actor_ref(1), adapter._actor_ref(3))
 
-    assert [obj.kinematic.x for obj in objects] == [10.0, 1.0, 2.0, 2.0]
-    assert [obj.kinematic.y for obj in objects] == [10.0, 5.0, 1.0, 3.0]
-    assert adapter._last_object_index_by_actor_id == {1: 0, 2: 1, 3: 2, 4: 3}
+    world.actors = _FakeActorList([first, second, ego, third])
+    reordered_ego, reordered_agents, _, _, _ = adapter._collect_objects()
+    assert reordered_ego.tracking_id == ego_frame.tracking_id
+    assert set(reordered_agents) == set(agents)
+    assert (adapter._actor_ref(1), adapter._actor_ref(3)) == refs_before_reorder
+
+
+def test_collect_objects_reflects_add_remove_and_rejects_id_reuse() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    ego = _FakeKinematicActor(actor_id=1)
+    original = _FakeKinematicActor(actor_id=2)
+    added = _FakeKinematicActor(actor_id=3)
+    world = _FakeRuntimeWorld([ego, original], frame=1, elapsed_seconds=0.0)
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._world = world
+    adapter._ego_vehicle = ego
+    adapter._objects_by_id = {}
+    adapter._prev_yaw_rate = {}
+    adapter._time_ns = 0
+    adapter._episode_start_carla_time_ns = 0
+    adapter._yaw_sign = 1.0
+    adapter._yaw_offset_deg = 0.0
+    adapter.config = {}
+
+    _, agents, _, _, _ = adapter._collect_objects()
+    assert set(agents) == {2}
+
+    world.actors = _FakeActorList([ego, added])
+    _, agents, _, _, _ = adapter._collect_objects()
+    assert set(agents) == {3}
+
+    world.actors = _FakeActorList([ego, added, _FakeKinematicActor(actor_id=2)])
+    with pytest.raises(SimulatorPreconditionFailed, match="reused retired actor ID"):
+        adapter._collect_objects()
+
+
+def test_shape_preserves_local_center_and_handedness() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    actor = _FakeKinematicActor(actor_id=7)
+    actor.bounding_box.location = SimpleNamespace(x=1.0, y=0.5, z=0.25)
+    actor.bounding_box.rotation = SimpleNamespace(roll=10.0, pitch=20.0, yaw=30.0)
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._yaw_sign = -1.0
+
+    shape = adapter._shape_from_actor(actor)
+
+    assert (
+        shape.dimensions.x,
+        shape.dimensions.y,
+        shape.dimensions.z,
+    ) == (4.0, 2.0, 1.5)
+    assert shape.center.x == 1.0
+    assert shape.center.y == -0.5
+    assert shape.center.z == 0.25
+    assert shape.center.roll == pytest.approx(math.radians(10.0))
+    assert shape.center.pitch == pytest.approx(math.radians(20.0))
+    assert shape.center.yaw == pytest.approx(-math.radians(30.0))
+    assert shape.reference_point == "carla_actor_origin"
+
+
+def test_entity_name_only_uses_declared_xosc_scenario_object_name() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._xosc_entity_names = {"Ego", "NPC"}
+    named = SimpleNamespace(attributes={"role_name": "NPC"})
+    background = SimpleNamespace(attributes={"role_name": "background"})
+
+    assert adapter._entity_name_from_actor(named) == "NPC"
+    assert adapter._entity_name_from_actor(background) is None
 
 
 def test_collision_details_include_episode_relative_time() -> None:
@@ -441,7 +521,7 @@ def test_collision_details_include_episode_relative_time() -> None:
         }
     ]
     adapter._ego_vehicle = SimpleNamespace(id=1)
-    adapter._last_object_index_by_actor_id = {1: 0, 2: 1}
+    adapter._actor_metadata_by_id = {1: ("Ego", ActorRole.EGO), 2: ("Agent", ActorRole.AGENT)}
 
     collisions = adapter._collect_collision_infos()
 
@@ -450,6 +530,12 @@ def test_collision_details_include_episode_relative_time() -> None:
     assert collisions[0].details["episode_frame"] == 2
     assert collisions[0].details["carla_timestamp_seconds"] == 12.6
     assert collisions[0].details["timestamp_seconds"] == pytest.approx(0.1)
+    assert collisions[0].actor_a.tracking_id == 1
+    assert collisions[0].actor_a.entity_name == "Ego"
+    assert collisions[0].actor_a.role == ActorRole.EGO
+    assert collisions[0].actor_b.tracking_id == 2
+    assert collisions[0].actor_b.entity_name == "Agent"
+    assert collisions[0].actor_b.role == ActorRole.AGENT
 
 
 def test_reset_finalizes_partial_state_on_failure(tmp_path) -> None:
@@ -539,9 +625,12 @@ def test_open_scenario_reset_delegates_world_loading_to_scenario_runner(tmp_path
     adapter._apply_world_settings = lambda: calls.append("apply_world_settings")
     adapter._record = True
     adapter._client = SimpleNamespace(start_recorder=lambda path: calls.append("start_recorder"))
-    adapter._start_scenario_runner = lambda scenario_pack, params: calls.append(
-        "start_scenario_runner"
-    )
+
+    def start_scenario_runner(scenario_pack, params):
+        calls.append("start_scenario_runner")
+        adapter._xosc_entity_names = {"ego", "agent1"}
+
+    adapter._start_scenario_runner = start_scenario_runner
     adapter._setup_collision_sensor = lambda: calls.append("setup_collision_sensor")
     adapter._tick_scenario_runner_module = lambda: calls.append("tick_scenario_runner")
     adapter._collect_collision_infos = lambda: []
@@ -566,7 +655,6 @@ def test_open_scenario_reset_delegates_world_loading_to_scenario_runner(tmp_path
     adapter._world = _FakeRuntimeWorld([ego_vehicle, other_vehicle], frame=10, elapsed_seconds=0.1)
     adapter._objects_by_id = {}
     adapter._prev_yaw_rate = {}
-    adapter._last_object_index_by_actor_id = {}
     adapter._last_applied_control = None
     adapter._yaw_sign = 1.0
     adapter._yaw_offset_deg = 0.0
@@ -584,12 +672,18 @@ def test_open_scenario_reset_delegates_world_loading_to_scenario_runner(tmp_path
     assert ("collect_runtime_frame", {11: 5.0, 12: 3.0}) in calls
     assert ego_vehicle.set_velocity_calls == [SimpleNamespace(x=5.0, y=0.0, z=0.0)]
     assert other_vehicle.set_velocity_calls == []
+    assert response.frame.ego.tracking_id == 11
+    assert response.frame.ego.object.entity_name == "ego"
+    assert response.frame.ego.object.state.shape.reference_point == "carla_actor_origin"
+    assert set(response.frame.agents) == {12}
+    assert response.frame.agents[12].entity_name == "agent1"
+    assert "object_index_by_actor_id" not in response.frame.extras
     adapter._world.frame = 11
     adapter._world.elapsed_seconds = 0.3
     ego_vehicle.forward_speed = 8.0
     step_frame = adapter._collect_runtime_frame()
-    assert step_frame.objects[0].kinematic.acceleration == pytest.approx(15.0)
-    assert step_frame.objects[0].kinematic.speed == pytest.approx(8.0)
+    assert step_frame.ego.object.state.kinematic.acceleration == pytest.approx(15.0)
+    assert step_frame.ego.object.state.kinematic.speed == pytest.approx(8.0)
     assert adapter._initial_speed_acceleration_pending is False
 
     adapter._world.frame = 12
@@ -597,7 +691,7 @@ def test_open_scenario_reset_delegates_world_loading_to_scenario_runner(tmp_path
     ego_vehicle.forward_speed = 9.0
     ego_vehicle.forward_accel = 0.7
     next_frame = adapter._collect_runtime_frame()
-    assert next_frame.objects[0].kinematic.acceleration == pytest.approx(0.7)
+    assert next_frame.ego.object.state.kinematic.acceleration == pytest.approx(0.7)
     assert isinstance(response.frame, RuntimeFrameData)
 
 
