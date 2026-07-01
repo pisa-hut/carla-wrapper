@@ -6,6 +6,12 @@ then runs a ScenarioRunner scenario for each reset.
 
 ## Runtime Contract
 
+The normative units, coordinate frames, identity, timestamp, shape, collision,
+and control semantics are defined by sim-core's
+`runner/docs/data-contracts/README.md`. This wrapper runs CARLA synchronously
+and exposes the canonical right-handed PISA frame. It rejects asynchronous
+execution and non-canonical `yaw_sign`/`yaw_offset_deg` values.
+
 The wrapper expects these paths to be mounted in the container:
 
 - `/mnt/map/xodr`: OpenDRIVE maps for wrapper-loaded maps. When the wrapper
@@ -29,7 +35,8 @@ The wrapper expects these paths to be mounted in the container:
 
 Common config keys accepted by `InitRequest.config`:
 
-- `synchronous_mode`: Enables CARLA synchronous mode. Defaults to `true`.
+- `synchronous_mode`: Must be `true` so absolute PISA timestamps map to fixed
+  CARLA ticks.
 - `no_rendering_mode`: Enables CARLA no-rendering mode. Defaults to `true`.
 - `record`: Records each run to `carla_recording.log`. Defaults to `false`.
 - `open_scenario_map_loader`: Selects who prepares the map for `open_scenario1`.
@@ -41,8 +48,10 @@ Common config keys accepted by `InitRequest.config`:
   the first reset after each `init()` generates the map. Later resets reuse it
   only when the current CARLA map is `OpenDriveMap` and its OpenDRIVE digest
   still matches; otherwise the wrapper regenerates the requested map.
-- `yaw_sign`: Coordinate yaw/sign convention multiplier. Defaults to `-1.0`.
-- `yaw_offset_deg`: Coordinate yaw offset in degrees. Defaults to `0.0`.
+- `yaw_sign`: Must be `-1.0` for CARLA-left-handed to PISA-right-handed
+  conversion.
+- `yaw_offset_deg`: Must be `0.0`; heading-only offsets are not a valid
+  world-frame transform.
 - `carla_connect_timeout_seconds`: Total CARLA connection retry window.
   Defaults to `40`.
 - `retry_interval_seconds`: Delay between CARLA connection attempts. Defaults
@@ -54,8 +63,9 @@ Common config keys accepted by `InitRequest.config`:
   `kinematic_yaw_acceleration_deadband_radps2`: Clamp near-zero output
   kinematic values to `0.0` before publishing runtime objects. Defaults are
   `0.02`, `0.15`, `0.003`, and `0.1`, respectively.
-- `ackermann_use_native_control`: Uses CARLA native Ackermann control when
-  enabled. Defaults to `false`.
+- `ackermann_use_native_control`: Selects CARLA native Ackermann control when
+  `true`, or the wrapper's VehicleControl speed-feedback backend when `false`.
+  Defaults to `false` for the established driving behavior.
 - `ackermann_native_speed_kp`, `ackermann_native_speed_ki`,
   `ackermann_native_speed_kd`, `ackermann_native_accel_kp`,
   `ackermann_native_accel_ki`, `ackermann_native_accel_kd`,
@@ -66,9 +76,40 @@ Common config keys accepted by `InitRequest.config`:
   `ackermann_min_brake`, `ackermann_max_brake`,
   `ackermann_accel_default`, `ackermann_decel_default`,
   `ackermann_jerk_default`, `ackermann_brake_jerk_default`: Parameters for
-  Ackermann native and fallback vehicle-control behavior.
+  native and fallback Ackermann behavior. Omitted acceleration and jerk use
+  the defaults documented in `config_example.yaml`.
 
 ScenarioRunner is loaded through the container `PYTHONPATH`.
+
+## Canonical Controls
+
+The wrapper accepts only the sim-core canonical action modes:
+
+- `THROTTLE_STEER_BREAK` requires exactly `throttle`, `brake`, and `steer`.
+  Values outside `[0,1]`, `[0,1]`, and `[-1,1]`, respectively, are rejected.
+  Positive PISA steer means left and is sign-converted for CARLA. Brake has
+  priority and forces applied throttle to zero.
+- `ACKERMANN` requires `steer` in radians and non-negative `speed` in m/s.
+  Optional fields are non-negative `steer_speed` in rad/s, signed
+  `acceleration` in m/s², and signed `jerk` in m/s³.
+- `NONE` is an empty-payload no-op. All legacy/reserved control modes are
+  rejected explicitly.
+
+Unknown, missing, non-numeric, non-finite, or out-of-range action fields are
+reported as invalid simulator requests rather than clipped or reinterpreted.
+
+## Collision Details
+
+`CollisionInfo.actor_a/b` carry authoritative CARLA tracking IDs and semantic
+metadata. The optional details mapping contains:
+
+- `carla_frame` and `carla_timestamp_seconds`: native event diagnostics;
+- `episode_frame` and `timestamp_seconds`: reset-relative diagnostics;
+- `other_actor_type_id` and `other_actor_semantic_tags`: CARLA classification;
+- `normal_impulse`: finite CARLA impulse components and magnitude in CARLA's
+  SI impulse unit (`kg·m/s`);
+- `actor_a_carla_id`/`actor_b_carla_id`: duplicate native IDs for diagnostics
+  only, never a separate identity namespace.
 
 ## Ports
 
