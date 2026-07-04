@@ -6,10 +6,13 @@ import subprocess
 import time
 import weakref
 from collections import deque
+from numbers import Real
 from pathlib import Path
 from threading import Lock
 
 from pisa_api.simulator import (
+    ActorRefData,
+    ActorRole,
     CollisionInfoData,
     ControlCommand,
     ControlMode,
@@ -22,10 +25,13 @@ from pisa_api.simulator import (
     RoadObjectType,
     RuntimeFrameData,
     ScenarioPackData,
+    ShapeCenterPoseData,
     ShapeData,
     ShapeDimensionData,
     ShapeType,
     ShouldQuitResponse,
+    SimulatorEgoData,
+    SimulatorObjectData,
     SimulatorPreconditionFailed,
     SimulatorTimeout,
     SimulatorUnavailable,
@@ -106,6 +112,34 @@ DEFAULT_CONFIG = {
 
 
 _OPEN_SCENARIO_MAP_LOADERS = {"scenario_runner", "wrapper"}
+
+_NONNEGATIVE_FINITE_CONFIG_KEYS = {
+    "kinematic_speed_deadband_mps",
+    "kinematic_acceleration_deadband_mps2",
+    "kinematic_yaw_rate_deadband_radps",
+    "kinematic_yaw_acceleration_deadband_radps2",
+    "ackermann_native_speed_kp",
+    "ackermann_native_speed_ki",
+    "ackermann_native_speed_kd",
+    "ackermann_native_accel_kp",
+    "ackermann_native_accel_ki",
+    "ackermann_native_accel_kd",
+    "ackermann_stop_speed_threshold",
+    "ackermann_accel_default",
+    "ackermann_decel_default",
+    "ackermann_brake_jerk_default",
+    "ackermann_speed_kp",
+    "ackermann_min_throttle",
+    "ackermann_max_throttle",
+    "ackermann_launch_speed_threshold",
+    "ackermann_launch_target_threshold",
+    "ackermann_launch_throttle",
+    "ackermann_brake_kp",
+    "ackermann_min_brake",
+    "ackermann_max_brake",
+}
+
+_FINITE_CONFIG_KEYS = _NONNEGATIVE_FINITE_CONFIG_KEYS | {"ackermann_jerk_default"}
 
 
 class _WorldLoadingDisabledClient:
@@ -193,10 +227,13 @@ class CarlaAdapter:
         self._finalized = True
         self._objects_by_id = {}
         self._prev_yaw_rate = {}
+        self._active_actor_ids: set[int] = set()
+        self._retired_actor_ids: set[int] = set()
+        self._actor_metadata_by_id: dict[int, tuple[str | None, ActorRole]] = {}
+        self._xosc_entity_names: set[str] = set()
         self._collision_sensor = None
         self._collision_events = deque()
         self._collision_lock = Lock()
-        self._last_object_index_by_actor_id: dict[int, int] = {}
         self._last_applied_control: dict | None = None
         self._quit_flag = False
         self._spawned_actor_ids: set[int] = set()
@@ -210,8 +247,8 @@ class CarlaAdapter:
         self._pre_scenario_actor_ids: set[int] | None = None
         self._episode_start_carla_time_ns: int | None = None
         self._episode_start_carla_frame: int | None = None
+        self._last_carla_frame: int | None = None
         self._initial_speed_acceleration_pending = False
-        self._initial_velocity_brake_suppression_pending = False
         self._initial_speed_overrides: dict[int, float] = {}
         self._quit_msg = ""
 
@@ -245,13 +282,38 @@ class CarlaAdapter:
         if not self._ensure_connected():
             raise SimulatorTimeout("Timed out connecting to CARLA")
 
-        self._fixed_delta_seconds = request.dt
+        try:
+            self._fixed_delta_seconds = float(request.dt)
+        except (TypeError, ValueError) as exc:
+            raise InvalidSimulatorRequest("Init.dt must be a finite positive number") from exc
+        if not math.isfinite(self._fixed_delta_seconds) or self._fixed_delta_seconds <= 0.0:
+            raise InvalidSimulatorRequest("Init.dt must be a finite positive number")
+        self._dt_ns = int(self._fixed_delta_seconds * 1e9)
+        if self._dt_ns <= 0:
+            raise InvalidSimulatorRequest("Init.dt is too small to represent in nanoseconds")
 
         self._sync = bool(self._config_value("synchronous_mode"))
         self._no_rendering = bool(self._config_value("no_rendering_mode"))
         self._record = bool(self._config_value("record"))
         self._yaw_sign = float(self._config_value("yaw_sign"))
         self._yaw_offset_deg = float(self._config_value("yaw_offset_deg"))
+        if not self._sync:
+            raise InvalidSimulatorRequest(
+                "synchronous_mode must be true for the PISA absolute timestamp contract"
+            )
+        if self._yaw_sign != -1.0 or self._yaw_offset_deg != 0.0:
+            raise InvalidSimulatorRequest(
+                "PISA canonical coordinates require yaw_sign=-1.0 and yaw_offset_deg=0.0"
+            )
+        for key in _FINITE_CONFIG_KEYS:
+            try:
+                value = float(self._config_value(key))
+            except (TypeError, ValueError) as exc:
+                raise InvalidSimulatorRequest(f"{key} must be a finite number") from exc
+            if not math.isfinite(value):
+                raise InvalidSimulatorRequest(f"{key} must be a finite number")
+            if key in _NONNEGATIVE_FINITE_CONFIG_KEYS and value < 0.0:
+                raise InvalidSimulatorRequest(f"{key} must be greater than or equal to zero")
         self._open_scenario_map_loader = (
             str(self._config_value("open_scenario_map_loader")).strip().lower()
         )
@@ -262,8 +324,8 @@ class CarlaAdapter:
                 f"expected one of: {choices}"
             )
 
-        self._max_steer_rad: float | None = None
         self._last_applied_control = None
+        self._max_steer_rad: float | None = None
         self._native_ackermann_settings_actor_id = None
         self._native_ackermann_settings_payload = None
         self._quit_flag = False
@@ -299,12 +361,14 @@ class CarlaAdapter:
             self._time_ns = 0
             self._episode_start_carla_time_ns = None
             self._episode_start_carla_frame = None
+            self._last_carla_frame = None
             self._quit_flag = False
             self._quit_msg = ""
             self._clear_collision_events()
             self._pre_scenario_actor_ids = None
             self._sr_last_tick_timestamp = None
             self._clear_post_reset_initialization_state()
+            self._reset_episode_identity()
 
             scenario_format = self.scenario.format
             is_open_scenario = scenario_format == "open_scenario1"
@@ -326,25 +390,28 @@ class CarlaAdapter:
                 self._client.start_recorder(p)
 
             if self._ego_vehicle is None:
-                logger.warning("Ego vehicle not found after starting ScenarioRunner")
+                raise SimulatorPreconditionFailed(
+                    "Ego vehicle not found after starting ScenarioRunner"
+                )
 
-            self._reset_episode_clock()
             self._setup_collision_sensor()
             if is_open_scenario:
                 speed_overrides = self._open_scenario_initial_speed_overrides()
                 self._apply_ego_initial_speed(speed_overrides)
+                self._reset_episode_clock()
                 response = ResetResponse(
-                    frame=self._collect_runtime_frame(speed_overrides=speed_overrides)
+                    frame=self._collect_runtime_frame(
+                        speed_overrides=speed_overrides,
+                        sim_time_ns=0,
+                    )
                 )
                 self._initial_speed_overrides = speed_overrides
                 self._initial_speed_acceleration_pending = bool(speed_overrides)
-                ego_id = getattr(self._ego_vehicle, "id", None)
-                self._initial_velocity_brake_suppression_pending = ego_id in speed_overrides
             else:
                 self._tick_scenario_runner_module()
-                if self._sync:
-                    self._world.tick()
-                response = ResetResponse(frame=self._collect_runtime_frame())
+                self._world.tick()
+                self._reset_episode_clock()
+                response = ResetResponse(frame=self._collect_runtime_frame(sim_time_ns=0))
                 self._clear_post_reset_initialization_state()
             success = True
             return response
@@ -357,14 +424,29 @@ class CarlaAdapter:
         if self._world is None:
             raise SimulatorUnavailable("CARLA world is not available")
 
-        self._tick_scenario_runner_module()
-        self._apply_ctrl(request.ctrl_cmd)
-        if self._sync:
-            self._world.tick()
-        else:
-            self._world.wait_for_tick()
-        self._initial_velocity_brake_suppression_pending = False
-        return StepResponse(frame=self._collect_runtime_frame())
+        if not self._sync:
+            raise SimulatorPreconditionFailed(
+                "CARLA world must remain synchronous during an episode"
+            )
+        next_time_ns = int(request.timestamp_ns)
+        if next_time_ns < self._time_ns:
+            raise InvalidSimulatorRequest(
+                f"step timestamp must be monotonic: got {next_time_ns}, current {self._time_ns}"
+            )
+        delta_ns = next_time_ns - self._time_ns
+        if delta_ns % self._dt_ns != 0:
+            raise InvalidSimulatorRequest(
+                f"step timestamp must align with dt_ns={self._dt_ns}: got {next_time_ns}"
+            )
+
+        step_count = delta_ns // self._dt_ns
+        if step_count == 0:
+            self._apply_ctrl(request.ctrl_cmd)
+        for _ in range(step_count):
+            self._tick_scenario_runner_module()
+            self._apply_ctrl(request.ctrl_cmd)
+            self._tick_world_once()
+        return StepResponse(frame=self._collect_runtime_frame(sim_time_ns=next_time_ns))
 
     def stop(self) -> None:
         self._finalize()
@@ -651,7 +733,10 @@ class CarlaAdapter:
         spawned_actor_ids.clear()
         self._objects_by_id.clear()
         self._prev_yaw_rate.clear()
-        self._last_object_index_by_actor_id.clear()
+        getattr(self, "_active_actor_ids", set()).clear()
+        getattr(self, "_retired_actor_ids", set()).clear()
+        getattr(self, "_actor_metadata_by_id", {}).clear()
+        getattr(self, "_xosc_entity_names", set()).clear()
         self._clear_collision_events()
 
     def _is_dynamic_actor(self, actor) -> bool:
@@ -723,6 +808,17 @@ class CarlaAdapter:
         if getattr(self, "_open_scenario_map_loader", "scenario_runner") == "wrapper":
             config_client = _WorldLoadingDisabledClient(self._client)
         config = OpenScenarioConfiguration(str(xosc_path), config_client, openscenario_params)
+        configured_actors = list(getattr(config, "ego_vehicles", [])) + list(
+            getattr(config, "other_actors", [])
+        )
+        entity_names = [
+            str(actor.rolename)
+            for actor in configured_actors
+            if getattr(actor, "rolename", None) is not None
+        ]
+        if len(entity_names) != len(set(entity_names)):
+            raise InvalidSimulatorRequest("OpenSCENARIO ScenarioObject names must be unique")
+        self._xosc_entity_names = set(entity_names)
         self._load_and_wait_for_scenario_runner_world(config)
         CarlaDataProvider.set_world(self._world)
         return config, xosc_path
@@ -968,26 +1064,151 @@ class CarlaAdapter:
         try:
             bb = actor.bounding_box
             dims = ShapeDimensionData(
-                x=float(bb.extent.x * 2.0),
-                y=float(bb.extent.y * 2.0),
-                z=float(bb.extent.z * 2.0),
+                x=self._require_simulator_finite(bb.extent.x * 2.0, "shape length"),
+                y=self._require_simulator_finite(bb.extent.y * 2.0, "shape width"),
+                z=self._require_simulator_finite(bb.extent.z * 2.0, "shape height"),
             )
-            return ShapeData(type=ShapeType.BOUNDING_BOX, dimensions=dims)
-        except Exception:
+            if dims.x <= 0.0 or dims.y <= 0.0 or dims.z <= 0.0:
+                raise SimulatorPreconditionFailed(
+                    f"CARLA actor {actor.id} has non-positive bounding-box dimensions"
+                )
+            location = getattr(bb, "location", None)
+            rotation = getattr(bb, "rotation", None)
+            center = ShapeCenterPoseData(
+                x=self._require_simulator_finite(getattr(location, "x", 0.0), "shape center x"),
+                y=self._require_simulator_finite(getattr(location, "y", 0.0), "shape center y")
+                * self._yaw_sign,
+                z=self._require_simulator_finite(getattr(location, "z", 0.0), "shape center z"),
+                roll=math.radians(
+                    self._require_simulator_finite(
+                        getattr(rotation, "roll", 0.0), "shape center roll"
+                    )
+                )
+                * self._yaw_sign,
+                pitch=math.radians(
+                    self._require_simulator_finite(
+                        getattr(rotation, "pitch", 0.0), "shape center pitch"
+                    )
+                ),
+                yaw=math.radians(
+                    self._require_simulator_finite(
+                        getattr(rotation, "yaw", 0.0), "shape center yaw"
+                    )
+                )
+                * self._yaw_sign,
+            )
             return ShapeData(
                 type=ShapeType.BOUNDING_BOX,
-                dimensions=ShapeDimensionData(x=0.0, y=0.0, z=0.0),
+                dimensions=dims,
+                center=center,
+                reference_point="carla_actor_origin",
             )
+        except SimulatorPreconditionFailed:
+            raise
+        except Exception as exc:
+            raise SimulatorPreconditionFailed(
+                f"Failed to read bounding box for CARLA actor {getattr(actor, 'id', 'unknown')}"
+            ) from exc
+
+    def _reset_episode_identity(self) -> None:
+        self._objects_by_id = {}
+        self._prev_yaw_rate = {}
+        self._active_actor_ids = set()
+        self._retired_actor_ids = set()
+        self._actor_metadata_by_id = {}
+        self._xosc_entity_names = set()
+
+    def _entity_name_from_actor(self, actor) -> str | None:
+        role_name = getattr(actor, "attributes", {}).get("role_name")
+        if role_name is None:
+            return None
+        role_name = str(role_name)
+        if role_name not in getattr(self, "_xosc_entity_names", set()):
+            return None
+        return role_name
+
+    def _actor_role(self, actor_id: int) -> ActorRole:
+        ego_id = getattr(getattr(self, "_ego_vehicle", None), "id", None)
+        return ActorRole.EGO if actor_id == ego_id else ActorRole.AGENT
+
+    @staticmethod
+    def _require_simulator_finite(value, field_name: str) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise SimulatorPreconditionFailed(
+                f"CARLA supplied non-numeric {field_name}: {value!r}"
+            ) from exc
+        if not math.isfinite(numeric):
+            raise SimulatorPreconditionFailed(
+                f"CARLA supplied non-finite {field_name}: {numeric!r}"
+            )
+        return numeric
+
+    @staticmethod
+    def _require_tracking_id(actor_id) -> int:
+        try:
+            tracking_id = int(actor_id)
+        except (TypeError, ValueError) as exc:
+            raise SimulatorPreconditionFailed(f"invalid CARLA actor ID: {actor_id!r}") from exc
+        if tracking_id < 0 or tracking_id > (1 << 64) - 1:
+            raise SimulatorPreconditionFailed(
+                f"CARLA actor ID is outside uint64 range: {tracking_id}"
+            )
+        return tracking_id
+
+    def _register_current_actor_ids(self, actors: list) -> None:
+        current_ids = {self._require_tracking_id(actor.id) for actor in actors}
+        active_ids = getattr(self, "_active_actor_ids", set())
+        retired_ids = getattr(self, "_retired_actor_ids", set())
+
+        reused_ids = (current_ids - active_ids) & retired_ids
+        if reused_ids:
+            reused = ", ".join(str(actor_id) for actor_id in sorted(reused_ids))
+            raise SimulatorPreconditionFailed(
+                f"CARLA reused retired actor ID(s) within one reset episode: {reused}"
+            )
+
+        retired_ids.update(active_ids - current_ids)
+        self._active_actor_ids = current_ids
+        self._retired_actor_ids = retired_ids
+
+    def _actor_ref(
+        self, actor_id: int | None, entity_name: str | None = None
+    ) -> ActorRefData | None:
+        if actor_id is None:
+            return None
+        actor_id = self._require_tracking_id(actor_id)
+        stored_name, stored_role = getattr(self, "_actor_metadata_by_id", {}).get(
+            actor_id,
+            (
+                None,
+                ActorRole.EGO
+                if actor_id == getattr(getattr(self, "_ego_vehicle", None), "id", None)
+                else ActorRole.ACTOR_ROLE_UNSPECIFIED,
+            ),
+        )
+        return ActorRefData(
+            tracking_id=actor_id,
+            entity_name=entity_name if entity_name is not None else stored_name,
+            role=stored_role,
+        )
 
     def _get_forward_speed(self, actor) -> float:
         vel = actor.get_velocity()
         fwd = actor.get_transform().get_forward_vector()
-        return float(vel.x * fwd.x + vel.y * fwd.y + vel.z * fwd.z)
+        return self._require_simulator_finite(
+            vel.x * fwd.x + vel.y * fwd.y + vel.z * fwd.z,
+            f"actor {actor.id} speed",
+        )
 
     def _get_forward_accel(self, actor) -> float:
         acc = actor.get_acceleration()
         fwd = actor.get_transform().get_forward_vector()
-        return float(acc.x * fwd.x + acc.y * fwd.y + acc.z * fwd.z)
+        return self._require_simulator_finite(
+            acc.x * fwd.x + acc.y * fwd.y + acc.z * fwd.z,
+            f"actor {actor.id} acceleration",
+        )
 
     def _deadband_value(self, value: float, config_key: str) -> float:
         threshold = abs(float(self._config_value(config_key)))
@@ -1083,11 +1304,13 @@ class CarlaAdapter:
             return settings_payload
 
         if not hasattr(self._ego_vehicle, "apply_ackermann_controller_settings"):
-            logger.warning("Ego vehicle does not support Ackermann controller settings")
-            return settings_payload
+            raise SimulatorPreconditionFailed(
+                "Ego vehicle does not support Ackermann controller settings"
+            )
         if not hasattr(carla, "AckermannControllerSettings"):
-            logger.warning("CARLA API does not provide AckermannControllerSettings")
-            return settings_payload
+            raise SimulatorPreconditionFailed(
+                "CARLA API does not provide AckermannControllerSettings"
+            )
 
         settings = carla.AckermannControllerSettings(**settings_payload)
         self._ego_vehicle.apply_ackermann_controller_settings(settings)
@@ -1098,12 +1321,14 @@ class CarlaAdapter:
     def _collect_runtime_frame(
         self,
         speed_overrides: dict[int, float] | None = None,
+        sim_time_ns: int | None = None,
     ) -> RuntimeFrameData:
         clear_initial_acceleration_state = speed_overrides is None and getattr(
             self, "_initial_speed_acceleration_pending", False
         )
-        objects, sim_time_ns, carla_frame, carla_time_ns = self._collect_objects(
-            speed_overrides=speed_overrides
+        ego, agents, sim_time_ns, carla_frame, carla_time_ns = self._collect_objects(
+            speed_overrides=speed_overrides,
+            sim_time_ns=sim_time_ns,
         )
         if clear_initial_acceleration_state:
             self._initial_speed_acceleration_pending = False
@@ -1114,23 +1339,18 @@ class CarlaAdapter:
             "carla_frame": carla_frame,
             "carla_time_ns": carla_time_ns,
             "episode_frame": self._episode_frame_from_carla_frame(carla_frame),
-            "object_index_by_actor_id": {
-                str(actor_id): index
-                for actor_id, index in self._last_object_index_by_actor_id.items()
-            },
             "collision_count": len(collisions),
             "untracked_collision_count": sum(
                 1 for collision in collisions if collision.actor_b is None
             ),
         }
-        if self._ego_vehicle is not None:
-            extras_payload["ego_actor_id"] = int(self._ego_vehicle.id)
         if self._last_applied_control is not None:
             extras_payload["last_applied_control"] = dict(self._last_applied_control)
 
         return RuntimeFrameData(
             sim_time_ns=sim_time_ns,
-            objects=objects,
+            ego=ego,
+            agents=agents,
             collision=collisions,
             extras=extras_payload,
         )
@@ -1146,7 +1366,20 @@ class CarlaAdapter:
             getattr(snapshot.timestamp, "elapsed_seconds", 0.0) * 1e9
         )
         self._episode_start_carla_frame = int(getattr(snapshot, "frame", 0))
+        self._last_carla_frame = self._episode_start_carla_frame
         self._time_ns = 0
+
+    def _tick_world_once(self) -> None:
+        previous_frame = self._last_carla_frame
+        self._world.tick()
+        snapshot = self._world.get_snapshot()
+        current_frame = int(getattr(snapshot, "frame", -1))
+        if previous_frame is not None and current_frame != previous_frame + 1:
+            raise SimulatorPreconditionFailed(
+                "CARLA synchronous tick did not advance exactly one frame: "
+                f"previous={previous_frame}, current={current_frame}"
+            )
+        self._last_carla_frame = current_frame
 
     def _episode_time_from_carla_time_ns(self, carla_time_ns: int) -> int:
         if getattr(self, "_episode_start_carla_time_ns", None) is None:
@@ -1161,39 +1394,63 @@ class CarlaAdapter:
     def _collect_objects(
         self,
         speed_overrides: dict[int, float] | None = None,
-    ) -> tuple[list[ObjectStateData], int, int, int]:
+        sim_time_ns: int | None = None,
+    ) -> tuple[SimulatorEgoData, dict[int, SimulatorObjectData], int, int, int]:
         if self._world is None:
-            return [], 0, 0, 0
+            raise SimulatorUnavailable("CARLA world is not available")
+        if self._ego_vehicle is None:
+            raise SimulatorPreconditionFailed("CARLA ego vehicle is not available")
 
         snapshot = self._world.get_snapshot()
-        carla_time_ns = int(snapshot.timestamp.elapsed_seconds * 1e9)
-        sim_time_ns = self._episode_time_from_carla_time_ns(carla_time_ns)
+        carla_elapsed_seconds = self._require_simulator_finite(
+            snapshot.timestamp.elapsed_seconds,
+            "snapshot elapsed_seconds",
+        )
+        carla_time_ns = int(carla_elapsed_seconds * 1e9)
+        if sim_time_ns is None:
+            sim_time_ns = self._episode_time_from_carla_time_ns(carla_time_ns)
+        if sim_time_ns < self._time_ns:
+            raise SimulatorPreconditionFailed(
+                f"runtime frame timestamp regressed: {sim_time_ns} < {self._time_ns}"
+            )
         carla_frame = int(snapshot.frame)
 
-        actors = []
-        actors.extend(self._world.get_actors().filter("vehicle.*"))
-        actors.extend(self._world.get_actors().filter("walker.pedestrian.*"))
+        world_actors = self._world.get_actors()
+        actors_by_id = {
+            self._require_tracking_id(actor.id): actor
+            for actor in world_actors
+            if getattr(actor, "type_id", "").startswith(("vehicle.", "walker.pedestrian."))
+            or self._entity_name_from_actor(actor) is not None
+        }
+        actors_by_id[self._require_tracking_id(self._ego_vehicle.id)] = self._ego_vehicle
+        actors = list(actors_by_id.values())
+        self._register_current_actor_ids(actors)
 
-        actor_ids = {a.id for a in actors}
+        actor_ids = {self._require_tracking_id(actor.id) for actor in actors}
         for stale_id in list(self._objects_by_id.keys()):
             if stale_id not in actor_ids:
                 self._objects_by_id.pop(stale_id, None)
                 self._prev_yaw_rate.pop(stale_id, None)
 
-        objects: list[ObjectStateData] = []
-        ordered_actors = []
-
         def upsert(actor):
             transform = actor.get_transform()
             ang = actor.get_angular_velocity()
 
-            yaw = self._from_carla_yaw(float(transform.rotation.yaw))
+            yaw = self._from_carla_yaw(
+                self._require_simulator_finite(
+                    transform.rotation.yaw,
+                    f"actor {actor.id} yaw",
+                )
+            )
             collected_speed = self._get_forward_speed(actor)
             speed = collected_speed
             if speed_overrides and actor.id in speed_overrides:
                 speed = speed_overrides[actor.id]
             accel = self._get_forward_accel(actor)
-            yaw_rate = math.radians(float(ang.z)) * self._yaw_sign
+            yaw_rate = (
+                math.radians(self._require_simulator_finite(ang.z, f"actor {actor.id} yaw rate"))
+                * self._yaw_sign
+            )
 
             prev_rate = self._prev_yaw_rate.get(actor.id, yaw_rate)
             dt_s = max(0.0, (sim_time_ns - self._time_ns) / 1e9)
@@ -1215,53 +1472,62 @@ class CarlaAdapter:
 
             kin = ObjectKinematicData(
                 time_ns=sim_time_ns,
-                x=float(transform.location.x),
-                y=float(transform.location.y) * self._yaw_sign,
-                z=float(transform.location.z),
-                yaw=float(yaw),
-                speed=float(speed),
-                acceleration=float(accel),
-                yaw_rate=float(yaw_rate),
-                yaw_acceleration=float(yaw_acc),
+                x=self._require_simulator_finite(transform.location.x, f"actor {actor.id} x"),
+                y=self._require_simulator_finite(transform.location.y, f"actor {actor.id} y")
+                * self._yaw_sign,
+                z=self._require_simulator_finite(transform.location.z, f"actor {actor.id} z"),
+                yaw=self._require_simulator_finite(yaw, f"actor {actor.id} canonical yaw"),
+                speed=self._require_simulator_finite(speed, f"actor {actor.id} canonical speed"),
+                acceleration=self._require_simulator_finite(
+                    accel, f"actor {actor.id} canonical acceleration"
+                ),
+                yaw_rate=self._require_simulator_finite(
+                    yaw_rate, f"actor {actor.id} canonical yaw rate"
+                ),
+                yaw_acceleration=self._require_simulator_finite(
+                    yaw_acc, f"actor {actor.id} yaw acceleration"
+                ),
             )
-            obj = self._objects_by_id.get(actor.id)
-            if obj is None:
-                obj = ObjectStateData(
-                    type=self._actor_type(actor),
-                    kinematic=kin,
-                    shape=self._shape_from_actor(actor),
-                )
-            else:
-                obj = ObjectStateData(
-                    type=obj.type,
-                    kinematic=kin,
-                    shape=obj.shape,
-                )
+            previous = self._objects_by_id.get(actor.id)
+            state = ObjectStateData(
+                type=previous.state.type if previous is not None else self._actor_type(actor),
+                kinematic=kin,
+                shape=previous.state.shape
+                if previous is not None
+                else self._shape_from_actor(actor),
+            )
+            entity_name = self._entity_name_from_actor(actor)
+            obj = SimulatorObjectData(state=state, entity_name=entity_name)
             self._objects_by_id[actor.id] = obj
+            metadata = getattr(self, "_actor_metadata_by_id", {})
+            actor_id = self._require_tracking_id(actor.id)
+            current_metadata = (
+                entity_name,
+                self._actor_role(actor_id),
+            )
+            previous_metadata = metadata.get(actor_id)
+            if previous_metadata is not None and previous_metadata != current_metadata:
+                raise SimulatorPreconditionFailed(
+                    f"CARLA actor {actor_id} identity changed within one episode: "
+                    f"previous={previous_metadata}, current={current_metadata}"
+                )
+            metadata[actor_id] = current_metadata
+            self._actor_metadata_by_id = metadata
 
             return obj
 
-        if self._ego_vehicle is not None:
-            objects.append(upsert(self._ego_vehicle))
-            ordered_actors.append(self._ego_vehicle)
-
-        non_ego_actors = [
-            actor
+        ego_id = self._require_tracking_id(self._ego_vehicle.id)
+        ego = SimulatorEgoData(tracking_id=ego_id, object=upsert(self._ego_vehicle))
+        agents = {
+            self._require_tracking_id(actor.id): upsert(actor)
             for actor in actors
-            if self._ego_vehicle is None or actor.id != self._ego_vehicle.id
-        ]
-        for actor in sorted(non_ego_actors, key=self._actor_sort_key):
-            objects.append(upsert(actor))
-            ordered_actors.append(actor)
-
-        self._last_object_index_by_actor_id = {
-            actor.id: index for index, actor in enumerate(ordered_actors)
+            if self._require_tracking_id(actor.id) != ego_id
         }
         self._time_ns = sim_time_ns
 
-        logger.debug("Collected %s objects at time %s ns", len(objects), sim_time_ns)
+        logger.debug("Collected ego and %s agents at time %s ns", len(agents), sim_time_ns)
 
-        return objects, sim_time_ns, carla_frame, carla_time_ns
+        return ego, agents, sim_time_ns, carla_frame, carla_time_ns
 
     def _open_scenario_initial_speed_overrides(self) -> dict[int, float]:
         scenario = getattr(self, "_sr_scenario", None)
@@ -1279,7 +1545,10 @@ class CarlaAdapter:
             role_name = getattr(actor_config, "rolename", None)
             if role_name is None:
                 continue
-            speed_by_role[str(role_name)] = float(getattr(actor_config, "speed", 0) or 0)
+            speed_by_role[str(role_name)] = self._require_simulator_finite(
+                getattr(actor_config, "speed", 0) or 0,
+                f"initial speed for XOSC actor {role_name}",
+            )
 
         actor_ids_by_role: dict[str, int] = {}
         for actor in getattr(scenario, "ego_vehicles", []) + getattr(scenario, "other_actors", []):
@@ -1317,18 +1586,7 @@ class CarlaAdapter:
 
     def _clear_post_reset_initialization_state(self) -> None:
         self._initial_speed_acceleration_pending = False
-        self._initial_velocity_brake_suppression_pending = False
         self._initial_speed_overrides = {}
-
-    def _actor_sort_key(self, actor) -> tuple[float, float, float, int]:
-        transform = actor.get_transform()
-        location = transform.location
-        return (
-            float(location.x),
-            float(location.y) * self._yaw_sign,
-            float(location.z),
-            int(actor.id),
-        )
 
     def _setup_collision_sensor(self) -> None:
         self._destroy_collision_sensor()
@@ -1385,6 +1643,10 @@ class CarlaAdapter:
             "timestamp": float(getattr(event, "timestamp", 0.0)),
             "actor_id": int(actor.id) if actor is not None else None,
             "other_actor_id": int(other_actor.id) if other_actor is not None else None,
+            "actor_entity_name": self._entity_name_from_actor(actor) if actor is not None else None,
+            "other_actor_entity_name": (
+                self._entity_name_from_actor(other_actor) if other_actor is not None else None
+            ),
             "other_actor_type_id": getattr(other_actor, "type_id", ""),
             "other_actor_semantic_tags": list(getattr(other_actor, "semantic_tags", [])),
             "normal_impulse": {
@@ -1402,19 +1664,26 @@ class CarlaAdapter:
             self._collision_events.clear()
 
         collisions: list[CollisionInfoData] = []
-        ego_actor_id = self._ego_vehicle.id if self._ego_vehicle is not None else None
         for event in events:
-            actor_a_index = self._last_object_index_by_actor_id.get(event["actor_id"])
-            if actor_a_index is None and event["actor_id"] == ego_actor_id:
-                actor_a_index = 0
-            actor_b_index = self._last_object_index_by_actor_id.get(event["other_actor_id"])
-            carla_timestamp_seconds = event["timestamp"]
+            carla_timestamp_seconds = self._require_simulator_finite(
+                event["timestamp"], "collision timestamp"
+            )
             episode_time_ns = self._episode_time_from_carla_time_ns(
                 int(carla_timestamp_seconds * 1e9)
             )
             episode_timestamp_seconds = episode_time_ns / 1e9
 
-            impulse = event["normal_impulse"]
+            raw_impulse = event["normal_impulse"]
+            impulse = {
+                axis: self._require_simulator_finite(
+                    raw_impulse[axis], f"collision normal impulse {axis}"
+                )
+                for axis in ("x", "y", "z")
+            }
+            impulse_magnitude = self._require_simulator_finite(
+                math.hypot(impulse["x"], impulse["y"], impulse["z"]),
+                "collision normal impulse magnitude",
+            )
             details_payload = {
                 "carla_frame": event["frame"],
                 "carla_timestamp_seconds": carla_timestamp_seconds,
@@ -1426,9 +1695,7 @@ class CarlaAdapter:
                     "x": impulse["x"],
                     "y": impulse["y"],
                     "z": impulse["z"],
-                    "magnitude": math.sqrt(
-                        impulse["x"] ** 2 + impulse["y"] ** 2 + impulse["z"] ** 2
-                    ),
+                    "magnitude": impulse_magnitude,
                 },
             }
             if event["actor_id"] is not None:
@@ -1439,112 +1706,139 @@ class CarlaAdapter:
             collisions.append(
                 CollisionInfoData(
                     occurred=True,
-                    actor_a=actor_a_index,
-                    actor_b=actor_b_index,
+                    actor_a=self._actor_ref(event["actor_id"], event.get("actor_entity_name")),
+                    actor_b=self._actor_ref(
+                        event["other_actor_id"], event.get("other_actor_entity_name")
+                    ),
                     details=details_payload,
                 )
             )
 
         return collisions
 
+    @staticmethod
+    def _validate_control_fields(
+        payload: dict,
+        *,
+        required: set[str],
+        optional: set[str] | None = None,
+    ) -> None:
+        optional = optional or set()
+        fields = set(payload)
+        missing = required - fields
+        unknown = fields - required - optional
+        if missing:
+            raise InvalidSimulatorRequest(
+                f"control payload is missing required field(s): {', '.join(sorted(missing))}"
+            )
+        if unknown:
+            raise InvalidSimulatorRequest(
+                f"control payload contains unknown field(s): {', '.join(sorted(unknown))}"
+            )
+
+    @staticmethod
+    def _control_number(payload: dict, field_name: str) -> float:
+        value = payload[field_name]
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise InvalidSimulatorRequest(
+                f"control field {field_name!r} must be a finite numeric scalar"
+            )
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise InvalidSimulatorRequest(f"control field {field_name!r} must be finite")
+        return numeric
+
     def _apply_ctrl(self, ctrl: ControlCommand | None) -> None:
         if self._ego_vehicle is None:
             return
-        if ctrl is None or ctrl.mode == ControlMode.NONE:
+        if ctrl is None:
             return
 
         payload = ctrl.payload
+        if not isinstance(payload, dict):
+            raise InvalidSimulatorRequest("control payload must be a mapping")
+
+        if ctrl.mode == ControlMode.NONE:
+            if payload:
+                raise InvalidSimulatorRequest("NONE control payload must be empty")
+            return
 
         if ctrl.mode == ControlMode.THROTTLE_STEER_BREAK:
-            throttle = _clamp(float(payload.get("throttle", 0.0)), 0.0, 1.0)
-            brake = _clamp(float(payload.get("brake", 0.0)), 0.0, 1.0)
-            if getattr(self, "_initial_velocity_brake_suppression_pending", False):
-                brake = 0.0
-            steer = _clamp(float(payload.get("steer", 0.0)), -1.0, 1.0)
+            self._validate_control_fields(
+                payload,
+                required={"throttle", "brake", "steer"},
+            )
+            throttle = self._control_number(payload, "throttle")
+            brake = self._control_number(payload, "brake")
+            steer = self._control_number(payload, "steer")
+            if not 0.0 <= throttle <= 1.0:
+                raise InvalidSimulatorRequest("throttle must be in [0, 1]")
+            if not 0.0 <= brake <= 1.0:
+                raise InvalidSimulatorRequest("brake must be in [0, 1]")
+            if not -1.0 <= steer <= 1.0:
+                raise InvalidSimulatorRequest("steer must be in [-1, 1]")
             if brake > 0.0:
                 throttle = 0.0
 
+            native_steer = steer * self._yaw_sign
             control = carla.VehicleControl(
-                throttle=throttle, steer=steer * self._yaw_sign, brake=brake
+                throttle=throttle,
+                steer=native_steer,
+                brake=brake,
             )
             self._ego_vehicle.apply_control(control)
             self._last_applied_control = {
                 "mode": ctrl.mode.name,
                 "throttle": throttle,
                 "brake": brake,
-                "steer": steer * self._yaw_sign,
+                "steer": steer,
+                "carla_steer": native_steer,
             }
             return
 
-        elif ctrl.mode == ControlMode.THROTTLE_STEER:
-            if "throttle" in payload or "brake" in payload:
-                throttle = float(payload.get("throttle", 0.0))
-                brake = float(payload.get("brake", 0.0))
-                steer = float(payload.get("steer", payload.get("wheel", 0.0)))
-                throttle = _clamp(throttle, 0.0, 1.0)
-                brake = _clamp(brake, 0.0, 1.0)
-                steer = _clamp(steer, -1.0, 1.0)
-            else:
-                pedal = float(payload.get("pedal", 0.0))
-                wheel = float(payload.get("wheel", 0.0))
-                if pedal >= 0:
-                    throttle = _clamp(abs(pedal), 0.0, 1.0)
-                    brake = 0.0
-                else:
-                    throttle = 0.0
-                    brake = _clamp(abs(pedal), 0.0, 1.0)
-                steer = _clamp(wheel, -1.0, 1.0)
-
-            if getattr(self, "_initial_velocity_brake_suppression_pending", False):
-                brake = 0.0
-            if brake > 0.0:
-                throttle = 0.0
-            control = carla.VehicleControl(
-                throttle=throttle, steer=steer * self._yaw_sign, brake=brake
+        if ctrl.mode == ControlMode.ACKERMANN:
+            self._validate_control_fields(
+                payload,
+                required={"steer", "speed"},
+                optional={"steer_speed", "acceleration", "jerk"},
             )
-            self._ego_vehicle.apply_control(control)
-            self._last_applied_control = {
-                "mode": ctrl.mode.name,
-                "throttle": throttle,
-                "brake": brake,
-                "steer": steer * self._yaw_sign,
-            }
-            return
-
-        elif ctrl.mode == ControlMode.ACKERMANN:
-            steer_speed = float(payload.get("steer_speed", 0.0))
-
-            steer = float(payload.get("steer", 0.0)) * self._yaw_sign
-            speed = (
-                float(payload["speed"])
-                if "speed" in payload
-                else self._get_forward_speed(self._ego_vehicle)
+            canonical_steer = self._control_number(payload, "steer")
+            target_speed = self._control_number(payload, "speed")
+            steer_speed = (
+                self._control_number(payload, "steer_speed") if "steer_speed" in payload else 0.0
             )
-            target_speed = max(speed, 0.0)
+            if target_speed < 0.0:
+                raise InvalidSimulatorRequest("ACKERMANN speed must be greater than or equal to 0")
+            if steer_speed < 0.0:
+                raise InvalidSimulatorRequest(
+                    "ACKERMANN steer_speed must be greater than or equal to 0"
+                )
+
+            steer = canonical_steer * self._yaw_sign
             current_forward_speed = self._ackermann_current_speed()
             stop_threshold = float(self._config_value("ackermann_stop_speed_threshold"))
             decelerating = target_speed < current_forward_speed - stop_threshold
 
-            acceleration = payload.get("acceleration", None)
-            if acceleration is None:
+            if "acceleration" not in payload:
                 if decelerating:
                     acceleration = -float(self._config_value("ackermann_decel_default"))
                 else:
                     acceleration = float(self._config_value("ackermann_accel_default"))
             else:
-                acceleration = float(acceleration)
-            jerk = payload.get("jerk", None)
-            if jerk is None:
+                acceleration = self._control_number(payload, "acceleration")
+            if "jerk" not in payload:
                 if decelerating:
                     jerk = float(self._config_value("ackermann_brake_jerk_default"))
                 else:
                     jerk = float(self._config_value("ackermann_jerk_default"))
             else:
-                jerk = float(jerk)
+                jerk = self._control_number(payload, "jerk")
 
-            if self._max_steer_rad:
-                steer = _clamp(steer, -self._max_steer_rad, self._max_steer_rad)
             if bool(self._config_value("ackermann_use_native_control")):
+                if not hasattr(carla, "VehicleAckermannControl"):
+                    raise SimulatorPreconditionFailed(
+                        "CARLA API does not provide VehicleAckermannControl"
+                    )
                 controller_settings = self._apply_native_ackermann_controller_settings()
                 control = carla.VehicleAckermannControl(
                     steer=steer,
@@ -1553,18 +1847,10 @@ class CarlaAdapter:
                     acceleration=acceleration,
                     jerk=jerk,
                 )
-
                 self._ego_vehicle.apply_ackermann_control(control)
                 applied_payload = {
-                    "mode": ctrl.mode.name,
                     "backend": "native_ackermann",
-                    "steer": steer,
-                    "steer_speed": steer_speed,
-                    "target_speed": target_speed,
-                    "current_forward_speed": current_forward_speed,
-                    "acceleration": acceleration,
-                    "jerk": jerk,
-                    "decelerating": decelerating,
+                    "carla_steer": steer,
                     "controller_settings": controller_settings,
                 }
             else:
@@ -1579,43 +1865,28 @@ class CarlaAdapter:
                 )
                 self._ego_vehicle.apply_control(control)
                 applied_payload = {
-                    "mode": ctrl.mode.name,
                     "backend": "vehicle_control",
                     "throttle": throttle,
                     "brake": brake,
-                    "steer": vehicle_steer,
-                    "target_speed": target_speed,
-                    "current_forward_speed": current_forward_speed,
-                    "acceleration": acceleration,
-                    "jerk": jerk,
-                    "decelerating": decelerating,
+                    "carla_steer": vehicle_steer,
                 }
 
             self._last_applied_control = {
+                "mode": ctrl.mode.name,
                 **applied_payload,
-                "ackermann_steer": steer,
-                "ackermann_steer_speed": steer_speed,
+                "steer": canonical_steer,
+                "steer_speed": steer_speed,
+                "target_speed": target_speed,
+                "current_forward_speed": current_forward_speed,
+                "acceleration": acceleration,
+                "jerk": jerk,
+                "decelerating": decelerating,
             }
             return
 
-        elif ctrl.mode == ControlMode.POSITION:
-            transform = self._ego_vehicle.get_transform()
-            x = float(payload.get("x", transform.location.x))
-            y = float(payload["y"]) * self._yaw_sign if "y" in payload else transform.location.y
-            z = float(payload.get("z", transform.location.z))
-            h = float(payload.get("h", self._from_carla_yaw(transform.rotation.yaw)))
-            yaw_deg = self._to_carla_yaw(h)
-
-            loc = carla.Location(x=x, y=y, z=z)
-            rot = carla.Rotation(
-                pitch=transform.rotation.pitch,
-                yaw=yaw_deg,
-                roll=transform.rotation.roll,
-            )
-            self._ego_vehicle.set_transform(carla.Transform(loc, rot))
-            return
-
-        logger.warning("Unsupported control mode: %s", ctrl.mode)
+        raise InvalidSimulatorRequest(
+            f"control mode {ctrl.mode.name} is legacy/reserved and not supported"
+        )
 
 
 CarlaSimulation = CarlaAdapter
