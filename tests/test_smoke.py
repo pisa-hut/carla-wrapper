@@ -15,6 +15,7 @@ from pisa_api.simulator import (
     RuntimeFrameData,
     SimulatorPreconditionFailed,
     SimulatorTimeout,
+    SimulatorUnavailable,
     StepRequest,
 )
 
@@ -164,6 +165,40 @@ def test_step_rejects_regressing_or_off_grid_timestamp(timestamp_ns) -> None:
             StepRequest(
                 ctrl_cmd=ControlCommand(mode=ControlMode.NONE),
                 timestamp_ns=timestamp_ns,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        (
+            AttributeError(
+                "LanePosition 'roadId=22, laneId=-1, s=55.0, offset=0.4' does not exist"
+            ),
+            "LanePosition",
+        ),
+        (
+            NotImplementedError("Negative target speeds are not yet supported"),
+            "Negative target speeds",
+        ),
+    ],
+)
+def test_step_marks_deterministic_scenario_errors_as_precondition_failures(error, message) -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._world = object()
+    adapter._sync = True
+    adapter._time_ns = 0
+    adapter._dt_ns = 50_000_000
+    adapter._tick_scenario_runner_module = lambda: (_ for _ in ()).throw(error)
+
+    with pytest.raises(SimulatorPreconditionFailed, match=message):
+        adapter.step(
+            StepRequest(
+                ctrl_cmd=ControlCommand(mode=ControlMode.NONE),
+                timestamp_ns=50_000_000,
             )
         )
 
@@ -375,6 +410,107 @@ def test_init_finalizes_previous_run_and_prepares_reused_server() -> None:
 
     assert calls == ["finalize", "prepare_reused_server"]
     assert adapter._wrapper_loaded_opendrive_digest is None
+
+
+def test_connect_reports_local_carla_process_exit_as_unavailable(monkeypatch) -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    monkeypatch.delenv("CARLA_HOST", raising=False)
+    monkeypatch.delenv("CARLA_PORT", raising=False)
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter.config = {
+        "carla_connect_timeout_seconds": 40,
+        "retry_interval_seconds": 0,
+    }
+    adapter._server_version = None
+    adapter._server_process = SimpleNamespace(pid=123, poll=lambda: 17)
+    adapter._server_log_path = "/tmp/carla_server"
+    adapter._connect = lambda timeout: (_ for _ in ()).throw(TimeoutError("RPC deadline"))
+
+    with pytest.raises(SimulatorUnavailable) as exc_info:
+        adapter._ensure_connected()
+
+    message = str(exc_info.value)
+    assert "process exited" in message
+    assert "localhost:2000" in message
+    assert "exit code 17" in message
+    assert "TimeoutError: RPC deadline" in message
+    assert "/tmp/carla_server/stderr.log" in message
+
+
+def test_connect_reports_running_process_with_unresponsive_rpc_as_timeout(monkeypatch) -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    monkeypatch.delenv("CARLA_HOST", raising=False)
+    monkeypatch.delenv("CARLA_PORT", raising=False)
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter.config = {
+        "carla_connect_timeout_seconds": 0,
+        "retry_interval_seconds": 0,
+    }
+    adapter._server_version = None
+    adapter._server_process = SimpleNamespace(pid=456, poll=lambda: None)
+    adapter._connect = lambda timeout: (_ for _ in ()).throw(TimeoutError("RPC deadline"))
+
+    with pytest.raises(SimulatorTimeout) as exc_info:
+        adapter._ensure_connected()
+
+    message = str(exc_info.value)
+    assert "process is still running (pid 456)" in message
+    assert "RPC did not respond" in message
+    assert "TimeoutError: RPC deadline" in message
+
+
+def test_connect_does_not_infer_remote_health_from_local_process(monkeypatch) -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    monkeypatch.setenv("CARLA_HOST", "carla.example.test")
+    monkeypatch.delenv("CARLA_PORT", raising=False)
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter.config = {
+        "carla_connect_timeout_seconds": 0,
+        "retry_interval_seconds": 0,
+    }
+    adapter._server_version = None
+    adapter._server_process = SimpleNamespace(
+        pid=789,
+        poll=lambda: (_ for _ in ()).throw(AssertionError("must not inspect local process")),
+    )
+    adapter._connect = lambda timeout: (_ for _ in ()).throw(ConnectionError("refused"))
+
+    with pytest.raises(SimulatorTimeout) as exc_info:
+        adapter._ensure_connected()
+
+    message = str(exc_info.value)
+    assert "carla.example.test:2000" in message
+    assert "remote CARLA server health cannot be inferred" in message
+
+
+def test_connect_retries_then_succeeds(monkeypatch) -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    monkeypatch.delenv("CARLA_HOST", raising=False)
+    monkeypatch.delenv("CARLA_PORT", raising=False)
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter.config = {
+        "carla_connect_timeout_seconds": 1,
+        "retry_interval_seconds": 0,
+    }
+    adapter._server_version = None
+    adapter._server_process = SimpleNamespace(pid=456, poll=lambda: None)
+    calls = []
+
+    def connect(timeout):
+        calls.append(timeout)
+        if len(calls) == 1:
+            raise TimeoutError("not ready")
+        adapter._server_version = "0.9.16"
+
+    adapter._connect = connect
+
+    adapter._ensure_connected()
+
+    assert calls == [2, 2]
 
 
 def test_init_rejects_unknown_open_scenario_map_loader() -> None:
@@ -776,6 +912,53 @@ def test_reset_finalizes_partial_state_on_failure(tmp_path) -> None:
     assert calls[1][0] == "ensure_world"
 
 
+def test_reset_marks_negative_initial_speed_as_precondition_failure(tmp_path) -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    calls = []
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._finalized = True
+    adapter._output_base = tmp_path
+    adapter.scenario = SimpleNamespace(format="open_scenario1")
+    adapter._open_scenario_map_loader = "scenario_runner"
+    adapter._clear_collision_events = lambda: None
+    adapter._ensure_world = lambda *args, **kwargs: None
+    adapter._clear_dynamic_actors = lambda: None
+    adapter._start_scenario_runner = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AttributeError("Warning: Speed value of actor Ego must be positive. Speed set to 0.")
+    )
+    adapter._finalize = lambda: calls.append("finalize")
+
+    request = SimpleNamespace(output_dir="run", scenario_pack=object(), params={})
+
+    with pytest.raises(SimulatorPreconditionFailed, match="Speed value of actor Ego"):
+        adapter.reset(request)
+
+    assert calls == ["finalize"]
+
+
+def test_reset_does_not_reclassify_unrecognized_attribute_error(tmp_path) -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._finalized = True
+    adapter._output_base = tmp_path
+    adapter.scenario = SimpleNamespace(format="open_scenario1")
+    adapter._open_scenario_map_loader = "scenario_runner"
+    adapter._clear_collision_events = lambda: None
+    adapter._ensure_world = lambda *args, **kwargs: None
+    adapter._clear_dynamic_actors = lambda: None
+    adapter._start_scenario_runner = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AttributeError("unexpected wrapper bug")
+    )
+    adapter._finalize = lambda: None
+
+    request = SimpleNamespace(output_dir="run", scenario_pack=object(), params={})
+
+    with pytest.raises(AttributeError, match="unexpected wrapper bug"):
+        adapter.reset(request)
+
+
 def test_open_scenario_wrapper_map_loader_generates_world_before_scenario_runner(tmp_path) -> None:
     from carla_wrapper.simulation import CarlaAdapter
 
@@ -1101,7 +1284,9 @@ def test_ensure_world_stops_when_reconnect_fails() -> None:
     adapter = CarlaAdapter.__new__(CarlaAdapter)
     adapter._server_version = None
     adapter._client = None
-    adapter._ensure_connected = lambda: False
+    adapter._ensure_connected = lambda: (_ for _ in ()).throw(
+        SimulatorTimeout("Timed out connecting to CARLA")
+    )
 
     with pytest.raises(SimulatorTimeout, match="Timed out connecting to CARLA"):
         adapter._ensure_world(SimpleNamespace(map_name="Town01"))

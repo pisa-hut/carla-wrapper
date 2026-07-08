@@ -73,6 +73,27 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def _is_non_runnable_scenario_error(exc: BaseException) -> bool:
+    """Return whether ScenarioRunner reported a deterministic scenario failure."""
+    message = str(exc)
+    return (
+        (
+            isinstance(exc, AttributeError)
+            and "LanePosition '" in message
+            and "does not exist" in message
+        )
+        or (
+            isinstance(exc, AttributeError)
+            and "Speed value of actor " in message
+            and "must be positive. Speed set to 0." in message
+        )
+        or (
+            isinstance(exc, NotImplementedError)
+            and message == "Negative target speeds are not yet supported"
+        )
+    )
+
+
 DEFAULT_CONFIG = {
     "synchronous_mode": True,
     "no_rendering_mode": True,
@@ -251,6 +272,7 @@ class CarlaAdapter:
         self._initial_speed_acceleration_pending = False
         self._initial_speed_overrides: dict[int, float] = {}
         self._quit_msg = ""
+        self._server_process = None
 
         self._server_log_path = "/mnt/output/carla_server"
         os.makedirs(self._server_log_path, exist_ok=True)
@@ -258,7 +280,7 @@ class CarlaAdapter:
             open(f"{self._server_log_path}/stdout.log", "w") as out,
             open(f"{self._server_log_path}/stderr.log", "w") as err,
         ):
-            subprocess.Popen(
+            self._server_process = subprocess.Popen(
                 ["/app/carla_server.sh"],
                 stdout=out,
                 stderr=err,
@@ -279,8 +301,7 @@ class CarlaAdapter:
         if not self._finalized:
             self._finalize()
 
-        if not self._ensure_connected():
-            raise SimulatorTimeout("Timed out connecting to CARLA")
+        self._ensure_connected()
 
         try:
             self._fixed_delta_seconds = float(request.dt)
@@ -415,6 +436,10 @@ class CarlaAdapter:
                 self._clear_post_reset_initialization_state()
             success = True
             return response
+        except (AttributeError, NotImplementedError) as exc:
+            if _is_non_runnable_scenario_error(exc):
+                raise SimulatorPreconditionFailed(str(exc)) from exc
+            raise
         finally:
             if not success:
                 logger.error("Failed to reset CARLA simulation; finalizing partial state")
@@ -439,14 +464,19 @@ class CarlaAdapter:
                 f"step timestamp must align with dt_ns={self._dt_ns}: got {next_time_ns}"
             )
 
-        step_count = delta_ns // self._dt_ns
-        if step_count == 0:
-            self._apply_ctrl(request.ctrl_cmd)
-        for _ in range(step_count):
-            self._tick_scenario_runner_module()
-            self._apply_ctrl(request.ctrl_cmd)
-            self._tick_world_once()
-        return StepResponse(frame=self._collect_runtime_frame(sim_time_ns=next_time_ns))
+        try:
+            step_count = delta_ns // self._dt_ns
+            if step_count == 0:
+                self._apply_ctrl(request.ctrl_cmd)
+            for _ in range(step_count):
+                self._tick_scenario_runner_module()
+                self._apply_ctrl(request.ctrl_cmd)
+                self._tick_world_once()
+            return StepResponse(frame=self._collect_runtime_frame(sim_time_ns=next_time_ns))
+        except (AttributeError, NotImplementedError) as exc:
+            if _is_non_runnable_scenario_error(exc):
+                raise SimulatorPreconditionFailed(str(exc)) from exc
+            raise
 
     def stop(self) -> None:
         self._finalize()
@@ -487,6 +517,24 @@ class CarlaAdapter:
 
         logger.info("Connected to CARLA")
 
+    @staticmethod
+    def _carla_endpoint() -> tuple[str, int]:
+        return (
+            os.environ.get("CARLA_HOST", "localhost"),
+            int(os.environ.get("CARLA_PORT", 2000)),
+        )
+
+    @staticmethod
+    def _is_local_carla_host(host: str) -> bool:
+        return host.strip().lower() in {"localhost", "127.0.0.1", "::1"}
+
+    @staticmethod
+    def _connection_error_details(exc: BaseException) -> str:
+        message = str(exc).strip()
+        if message:
+            return f"{type(exc).__name__}: {message}"
+        return type(exc).__name__
+
     def _to_carla_yaw(self, yaw_rad: float) -> float:
         return self._yaw_sign * math.degrees(yaw_rad) + self._yaw_offset_deg
 
@@ -496,28 +544,66 @@ class CarlaAdapter:
     def _from_carla_yaw(self, yaw_deg: float) -> float:
         return math.radians((yaw_deg - self._yaw_offset_deg) * self._yaw_sign)
 
-    def _ensure_connected(self) -> bool:
-        timeout = self._config_value("carla_connect_timeout_seconds")
-        retry_interval = self._config_value("retry_interval_seconds")
+    def _ensure_connected(self) -> None:
+        timeout = float(self._config_value("carla_connect_timeout_seconds"))
+        retry_interval = float(self._config_value("retry_interval_seconds"))
+        host, port = self._carla_endpoint()
 
-        end_time = time.time() + timeout
-
+        end_time = time.monotonic() + timeout
         while self._server_version is None:
             try:
                 self._connect(2)
-                return True
+                return
 
-            except Exception:
-                remaining = end_time - time.time()
+            except Exception as exc:
+                error_details = self._connection_error_details(exc)
+
+                if self._is_local_carla_host(host):
+                    server_process = getattr(self, "_server_process", None)
+                    if server_process is not None:
+                        return_code = server_process.poll()
+                        if return_code is not None:
+                            raise SimulatorUnavailable(
+                                "CARLA server process exited before RPC connection to "
+                                f"{host}:{port} (exit code {return_code}); "
+                                f"last RPC error: {error_details}; "
+                                "stderr: "
+                                f"{getattr(self, '_server_log_path', '/mnt/output/carla_server')}"
+                                "/stderr.log"
+                            ) from exc
+
+                remaining = end_time - time.monotonic()
 
                 if remaining <= 0:
-                    logger.error("Failed to connect to CARLA: connection timeout.")
-                    return False
+                    server_process = getattr(self, "_server_process", None)
+                    if self._is_local_carla_host(host) and server_process is not None:
+                        return_code = server_process.poll()
+                        if return_code is not None:
+                            raise SimulatorUnavailable(
+                                "CARLA server process exited before RPC connection to "
+                                f"{host}:{port} (exit code {return_code}); "
+                                f"last RPC error: {error_details}; "
+                                "stderr: "
+                                f"{getattr(self, '_server_log_path', '/mnt/output/carla_server')}"
+                                "/stderr.log"
+                            ) from exc
+                        process_details = (
+                            "local CARLA server process is still running "
+                            f"(pid {server_process.pid}) but RPC did not respond"
+                        )
+                    elif self._is_local_carla_host(host):
+                        process_details = "local CARLA server process health is unavailable"
+                    else:
+                        process_details = (
+                            "remote CARLA server health cannot be inferred from the local process"
+                        )
+                    raise SimulatorTimeout(
+                        f"Timed out after {timeout:g}s connecting to CARLA RPC at "
+                        f"{host}:{port}; {process_details}; last RPC error: {error_details}"
+                    ) from exc
 
                 logger.error(f"Failed to connect to CARLA, retrying in {retry_interval} seconds...")
-                time.sleep(retry_interval)
-
-        return True
+                time.sleep(min(retry_interval, remaining))
 
     def _ensure_world(
         self,
@@ -527,8 +613,8 @@ class CarlaAdapter:
         if sps is None:
             raise InvalidSimulatorRequest("ScenarioPack is required to prepare CARLA world")
 
-        if self._server_version is None and not self._ensure_connected():
-            raise SimulatorTimeout("Timed out connecting to CARLA before loading world")
+        if self._server_version is None:
+            self._ensure_connected()
         if self._client is None:
             raise SimulatorUnavailable("CARLA client is not available")
 

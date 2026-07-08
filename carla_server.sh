@@ -1,6 +1,6 @@
 #!/bin/bash
 
-pushd /opt/carla
+cd /opt/carla || exit 1
 CMD=(
     "./CarlaUE4.sh"
     "-RenderOffScreen"
@@ -10,5 +10,4 @@ CMD=(
     "-carla-tm-port=${CARLA_TM_PORT:-8000}"
 )
 echo "Running command: ${CMD[*]}"
-"${CMD[@]}"
-popd
+exec "${CMD[@]}"
