@@ -1,5 +1,0 @@
-Running command: ./CarlaUE4.sh -RenderOffScreen -nosound -carla-port=2000 -carla-rpc-timeout=30 -carla-tm-port=8000
-4.26.2-0+++UE4+Release-4.26 522 0
-Disabling core dumps.
-CommonUnixCrashHandler: Signal=11
-Engine crash handling finished; re-raising signal 11 for the default handler. Good bye.
