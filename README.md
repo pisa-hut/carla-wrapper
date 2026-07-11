@@ -6,6 +6,24 @@ then runs a ScenarioRunner scenario for each reset.
 
 ## Runtime Contract
 
+Ping identifies this artifact with `name="carla-wrapper"`; its `version` is the
+installed wrapper distribution/build version. A successful Init identifies the
+simulator component with `name="carla"` and returns metadata that is written to
+the execution manifest. Wrapper and runner deployments must use compatible
+versions of the newer `pisa-api` Ping/Init contract.
+
+Init metadata contains CARLA `client_version` (when available), `server_version`,
+`host`, RPC `port`, `traffic_manager_port`, and a nested `config` allowlist with
+the effective values for `synchronous_mode`, `no_rendering_mode`, `record`,
+`open_scenario_map_loader`, `yaw_sign`, `yaw_offset_deg`,
+`scenario_runner_tm_seed`, `ackermann_use_native_control`, all kinematic output
+deadbands, and all Ackermann controller gains, limits, launch thresholds, and
+acceleration/deceleration/jerk defaults. These are normalized effective values,
+including defaults, because they can affect test results. Connection timeout and
+retry settings, common request fields such as `dt`, and output paths are omitted.
+Map identity is not reported by Init because maps are loaded during Reset. Never
+place secrets in these settings: metadata is persisted in the execution manifest.
+
 The normative units, coordinate frames, identity, timestamp, shape, collision,
 and control semantics are defined by sim-core's
 `runner/docs/data-contracts/README.md`. This wrapper runs CARLA synchronously

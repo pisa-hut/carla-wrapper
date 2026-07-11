@@ -15,8 +15,8 @@ sdist = { url = "https://files.pythonhosted.org/packages/4e/cc/f268dcff9983d26d6
 
 [[package]]
 name = "carla-wrapper"
-version = "0.2.0"
-source = { virtual = "." }
+version = "0.2.1"
+source = { editable = "." }
 dependencies = [
     { name = "antlr4-python3-runtime" },
     { name = "ephem" },
@@ -51,7 +51,7 @@ requires-dist = [
     { name = "networkx", specifier = "==3.4.2" },
     { name = "numpy", marker = "python_full_version >= '3'", specifier = "==1.24.4" },
     { name = "opencv-python", specifier = "==4.7.0.72" },
-    { name = "pisa-api", git = "https://github.com/pisa-hut/pisa-api.git?rev=709d811ee605ffe84f5a34de98710bca10dfd611" },
+    { name = "pisa-api", git = "https://github.com/pisa-hut/pisa-api.git" },
     { name = "psutil", specifier = ">=7.2.2" },
     { name = "py-trees", specifier = "==0.8.3" },
     { name = "rich", specifier = ">=15.0.0" },
@@ -352,8 +352,8 @@ wheels = [
 
 [[package]]
 name = "pisa-api"
-version = "0.4.0"
-source = { git = "https://github.com/pisa-hut/pisa-api.git?rev=709d811ee605ffe84f5a34de98710bca10dfd611#709d811ee605ffe84f5a34de98710bca10dfd611" }
+version = "0.4.1"
+source = { git = "https://github.com/pisa-hut/pisa-api.git#961982b666ec5aa904436894c8f9d800d5466f75" }
 dependencies = [
     { name = "grpcio" },
     { name = "protobuf" },

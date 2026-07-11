@@ -38,11 +38,12 @@ USER carla
 WORKDIR /app
 COPY --chown=carla:carla ./pyproject.toml .
 COPY --chown=carla:carla ./uv.lock .
-RUN uv sync --locked
-RUN uv add /opt/carla/PythonAPI/carla/dist/carla-0.9.16-cp310-cp310-linux_x86_64.whl
-RUN uv add -r /opt/scenario_runner/requirements.txt
+RUN uv sync --locked --no-dev --no-install-project
 ENV PYTHONPATH=/opt/scenario_runner/:/opt/carla/PythonAPI/carla/
 COPY --chown=carla:carla  . .
+RUN uv sync --locked --no-dev
+RUN uv pip install /opt/carla/PythonAPI/carla/dist/carla-0.9.16-cp310-cp310-linux_x86_64.whl
+RUN uv pip install -r /opt/scenario_runner/requirements.txt
 
 ENV PORT=50051
 ENV CARLA_PORT=2000

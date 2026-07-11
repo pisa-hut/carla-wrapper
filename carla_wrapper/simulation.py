@@ -17,6 +17,7 @@ from pisa_api.simulator import (
     ControlCommand,
     ControlMode,
     InitRequest,
+    InitResponse,
     InvalidSimulatorRequest,
     ObjectKinematicData,
     ObjectStateData,
@@ -162,6 +163,8 @@ _NONNEGATIVE_FINITE_CONFIG_KEYS = {
 
 _FINITE_CONFIG_KEYS = _NONNEGATIVE_FINITE_CONFIG_KEYS | {"ackermann_jerk_default"}
 
+_RESULT_AFFECTING_FLOAT_CONFIG_KEYS = tuple(sorted(_FINITE_CONFIG_KEYS))
+
 
 class _WorldLoadingDisabledClient:
     """Forward CARLA client calls while preventing ScenarioRunner world replacement."""
@@ -293,7 +296,7 @@ class CarlaAdapter:
             msg = "CARLA simulator requested quit"
         return ShouldQuitResponse(should_quit=self._quit_flag, msg=msg)
 
-    def init(self, request: InitRequest) -> None:
+    def init(self, request: InitRequest) -> InitResponse:
         self._output_base = request.output_dir
         self.config = request.config
         self.scenario = request.scenario
@@ -368,7 +371,41 @@ class CarlaAdapter:
         self._wrapper_loaded_opendrive_digest = None
         self._prepare_reused_server_state()
 
-        return None
+        return InitResponse(name="carla", metadata=self._init_metadata())
+
+    def _init_metadata(self) -> dict:
+        host, port = self._carla_endpoint()
+        metadata = {
+            "host": host,
+            "port": port,
+            "traffic_manager_port": self._scenario_runner_tm_port,
+            "config": {
+                "synchronous_mode": self._sync,
+                "no_rendering_mode": self._no_rendering,
+                "record": self._record,
+                "open_scenario_map_loader": self._open_scenario_map_loader,
+                "yaw_sign": self._yaw_sign,
+                "yaw_offset_deg": self._yaw_offset_deg,
+                "scenario_runner_tm_seed": self._scenario_runner_tm_seed,
+                "ackermann_use_native_control": bool(
+                    self._config_value("ackermann_use_native_control")
+                ),
+                **{
+                    key: float(self._config_value(key))
+                    for key in _RESULT_AFFECTING_FLOAT_CONFIG_KEYS
+                },
+            },
+        }
+        if self._server_version:
+            metadata["server_version"] = str(self._server_version)
+        try:
+            client_version = self._client.get_client_version()
+        except Exception:
+            logger.warning("Could not read optional CARLA client version", exc_info=True)
+        else:
+            if client_version:
+                metadata["client_version"] = str(client_version)
+        return metadata
 
     def reset(self, request: ResetRequest) -> ResetResponse:
         if not self._finalized:
