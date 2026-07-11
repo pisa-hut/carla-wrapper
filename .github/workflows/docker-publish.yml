@@ -68,11 +68,11 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f95db51fddba0c2d1ec667646a06c2ce06100226 # v3.0.0
 
-      # Single source of truth for both the docker image tag and the SIF
-      # tag, per matrix flavor. On main branch builds the tag is just the
-      # flavor name (`:main`, `:native`) — what the DB rows reference. On
-      # any other ref (feature branch, tag push, PR) we slugify ref_name
-      # and suffix it so per-branch builds don't collide on the registry.
+      # Single source of truth for the docker image tag per matrix flavor.
+      # On main branch builds the tag is just the flavor name (`:main`,
+      # `:native`) — what the DB rows reference. On any other ref (feature
+      # branch, tag push, PR) we slugify ref_name and suffix it so per-branch
+      # builds don't collide on the registry.
       - name: Compute image tag
         id: tag
         env:
@@ -141,55 +141,3 @@ jobs:
         # This step uses the identity token to provision an ephemeral certificate
         # against the sigstore community Fulcio instance.
         run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
-
-      # ─── Apptainer SIF build + push (oras://docker.io/<ns>/<repo>-sif) ─
-      # Builds the SIF from the docker image we just pushed (pinned by
-      # digest so we ship the exact bits), then pushes to a SIF-specific
-      # Docker Hub repo. Self-hosted runner is assumed to have apptainer
-      # pre-installed (controller node ships with it for the existing
-      # ansible flow).
-      - name: Build and push Apptainer SIF
-        if: github.event_name != 'pull_request'
-        env:
-          DIGEST: ${{ steps.build-and-push.outputs.digest }}
-        run: |
-          set -euo pipefail
-          SIF_REPO="$(echo '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-sif' | tr '[:upper:]' '[:lower:]')"
-          DOCKER_PINNED="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}"
-
-          cat > apptainer.def <<EOD
-          Bootstrap: docker
-          From: ${DOCKER_PINNED}
-
-          %startscript
-          #!/bin/bash
-          bash /app/entrypoint.sh
-          EOD
-
-          # Reuse the docker config that docker/login-action populated for the
-          # image push — apptainer's own `registry login` / `remote login` don't
-          # propagate creds to the OCI push code path on Docker Hub. Setting
-          # REGISTRY_AUTH_FILE makes the containers/image library that apptainer
-          # delegates to look at the same file the docker push used.
-          export REGISTRY_AUTH_FILE="${DOCKER_CONFIG:-$HOME/.docker}/config.json"
-
-          # 3 retries: the OCI layer fetch can hit transient
-          # `connection reset by peer` on the multi-GB layers.
-          # Apptainer's OCI cache keeps already-fetched layers
-          # across attempts, so retries are cheap.
-          for attempt in 1 2 3; do
-            if apptainer build wrapper.sif apptainer.def; then
-              break
-            fi
-            echo "apptainer build attempt $attempt failed; retrying"
-            sleep 5
-            [ "$attempt" = "3" ] && exit 1
-          done
-
-          # Mirror the docker image tag so consumers can pair them by name:
-          # `:main` docker image ↔ `:main` SIF, `:native` ↔ `:native`, etc.
-          # No `:latest` alias — with multiple flavors, latest is ambiguous;
-          # per-flavor stable tags are the canonical name.
-          REF_TAG="${{ steps.tag.outputs.tag }}"
-          apptainer push wrapper.sif "oras://${SIF_REPO}:${REF_TAG}"
-          echo "SIF pushed: oras://${SIF_REPO}:${REF_TAG}"
