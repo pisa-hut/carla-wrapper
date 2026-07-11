@@ -390,11 +390,15 @@ def test_finalize_clears_dynamic_actors_and_leaves_server_async() -> None:
 
 
 def test_init_finalizes_previous_run_and_prepares_reused_server() -> None:
+    from pisa_api.simulator import InitResponse
+
     from carla_wrapper.simulation import CarlaAdapter
 
     calls = []
     adapter = CarlaAdapter.__new__(CarlaAdapter)
     adapter._finalized = False
+    adapter._server_version = "0.9.16-server"
+    adapter._client = SimpleNamespace(get_client_version=lambda: "0.9.16-client")
     adapter._finalize = lambda: calls.append("finalize")
     adapter._ensure_connected = lambda: True
     adapter._prepare_reused_server_state = lambda: calls.append("prepare_reused_server")
@@ -406,9 +410,11 @@ def test_init_finalizes_previous_run_and_prepares_reused_server() -> None:
         dt=0.05,
     )
 
-    adapter.init(request)
+    response = adapter.init(request)
 
     assert calls == ["finalize", "prepare_reused_server"]
+    assert isinstance(response, InitResponse)
+    assert response.name == "carla"
     assert adapter._wrapper_loaded_opendrive_digest is None
 
 
