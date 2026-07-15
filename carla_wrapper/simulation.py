@@ -350,16 +350,12 @@ class CarlaAdapter:
             raw_async_lifecycle = self._config_value("allow_async_world_lifecycle")
         if raw_async_lifecycle is None:
             if "allow_async_world_lifecycle" in config:
-                raise InvalidSimulatorRequest(
-                    "allow_async_world_lifecycle must be true or false"
-                )
+                raise InvalidSimulatorRequest("allow_async_world_lifecycle must be true or false")
             self._allow_async_world_lifecycle = legacy_mode == "standard"
         elif isinstance(raw_async_lifecycle, bool):
             self._allow_async_world_lifecycle = raw_async_lifecycle
         else:
-            raise InvalidSimulatorRequest(
-                "allow_async_world_lifecycle must be true or false"
-            )
+            raise InvalidSimulatorRequest("allow_async_world_lifecycle must be true or false")
         if legacy_mode is not None:
             legacy_async_lifecycle = legacy_mode == "standard"
             if (
@@ -403,9 +399,7 @@ class CarlaAdapter:
             raise InvalidSimulatorRequest(
                 "physics substepping values must be finite positive numbers"
             )
-        substep_capacity = (
-            self._physics_max_substep_delta_seconds * self._physics_max_substeps
-        )
+        substep_capacity = self._physics_max_substep_delta_seconds * self._physics_max_substeps
         if self._physics_substepping and self._fixed_delta_seconds > substep_capacity:
             message = (
                 "fixed_delta_seconds exceeds physics substepping capacity: "
@@ -492,9 +486,7 @@ class CarlaAdapter:
                 "allow_async_world_lifecycle": self._allow_async_world_lifecycle,
                 "reload_world_between_episodes": self._reload_world_between_episodes,
                 "physics_substepping": self._physics_substepping,
-                "physics_max_substep_delta_seconds": (
-                    self._physics_max_substep_delta_seconds
-                ),
+                "physics_max_substep_delta_seconds": (self._physics_max_substep_delta_seconds),
                 "physics_max_substeps": self._physics_max_substeps,
                 "open_scenario_map_loader": self._open_scenario_map_loader,
                 "yaw_sign": self._yaw_sign,
@@ -998,9 +990,7 @@ class CarlaAdapter:
 
         expected_name, expected_digest = self._world_identity(self._world)
         try:
-            traffic_manager = self._client.get_trafficmanager(
-                self._scenario_runner_tm_port
-            )
+            traffic_manager = self._client.get_trafficmanager(self._scenario_runner_tm_port)
             traffic_manager.set_synchronous_mode(False)
             reloaded_world = self._client.reload_world(False)
             if reloaded_world is None:
@@ -1021,9 +1011,7 @@ class CarlaAdapter:
                 f"CARLA world changed during reload: {expected_name} -> {actual_name}"
             )
         if expected_digest is not None and actual_digest != expected_digest:
-            raise SimulatorPreconditionFailed(
-                "CARLA OpenDRIVE content changed during reload"
-            )
+            raise SimulatorPreconditionFailed("CARLA OpenDRIVE content changed during reload")
 
         settings = reloaded_world.get_settings()
         expected_settings = {
@@ -1049,8 +1037,7 @@ class CarlaAdapter:
                 mismatches.append(f"{name}={actual!r} (expected {expected!r})")
         if mismatches:
             raise SimulatorUnavailable(
-                "CARLA did not preserve world settings across reload: "
-                + ", ".join(mismatches)
+                "CARLA did not preserve world settings across reload: " + ", ".join(mismatches)
             )
 
     def _prepare_world_for_scenario(
@@ -1090,9 +1077,7 @@ class CarlaAdapter:
             self._world,
             client=getattr(self, "_client", None),
             traffic_manager_port=getattr(self, "_scenario_runner_tm_port", 8000),
-            keep_synchronous=not getattr(
-                self, "_allow_async_world_lifecycle", False
-            ),
+            keep_synchronous=not getattr(self, "_allow_async_world_lifecycle", False),
             log=logger,
         )
 
@@ -1142,9 +1127,7 @@ class CarlaAdapter:
             self._world,
             client=getattr(self, "_client", None),
             traffic_manager_port=getattr(self, "_scenario_runner_tm_port", 8000),
-            keep_synchronous=not getattr(
-                self, "_allow_async_world_lifecycle", False
-            ),
+            keep_synchronous=not getattr(self, "_allow_async_world_lifecycle", False),
             log=logger,
         )
 

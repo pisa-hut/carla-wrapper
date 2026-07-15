@@ -36,10 +36,7 @@ def force_async_world_for_cleanup(
         elif not keep_synchronous and getattr(settings, "synchronous_mode", False):
             settings.synchronous_mode = False
             changed = True
-        if (
-            not keep_synchronous
-            and getattr(settings, "fixed_delta_seconds", None) is not None
-        ):
+        if not keep_synchronous and getattr(settings, "fixed_delta_seconds", None) is not None:
             settings.fixed_delta_seconds = None
             changed = True
         # An asynchronous world advances without client ticks. If rendering is
@@ -60,9 +57,7 @@ def force_async_world_for_cleanup(
         return
 
     try:
-        client.get_trafficmanager(traffic_manager_port).set_synchronous_mode(
-            keep_synchronous
-        )
+        client.get_trafficmanager(traffic_manager_port).set_synchronous_mode(keep_synchronous)
     except Exception:
         mode = "synchronous" if keep_synchronous else "asynchronous"
         log.exception("Failed to set TrafficManager %s mode for cleanup", mode)

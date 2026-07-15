@@ -398,9 +398,7 @@ def test_strict_cleanup_keeps_world_and_traffic_manager_synchronous() -> None:
     from carla_wrapper.simulation import CarlaAdapter
 
     vehicle = _FakeActor(actor_id=1, type_id="vehicle.tesla.model3")
-    world = _FakeSettingsWorld(
-        [vehicle], synchronous_mode=True, fixed_delta_seconds=0.05
-    )
+    world = _FakeSettingsWorld([vehicle], synchronous_mode=True, fixed_delta_seconds=0.05)
     traffic_manager = _FakeTrafficManager()
     adapter = CarlaAdapter.__new__(CarlaAdapter)
     adapter._allow_async_world_lifecycle = False

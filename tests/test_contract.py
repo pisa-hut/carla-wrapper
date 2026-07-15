@@ -167,14 +167,9 @@ def test_legacy_determinism_mode_maps_to_lifecycle_option(
 ) -> None:
     adapter, _ = _initialized_adapter(monkeypatch)
 
-    response = adapter.init(
-        InitRequest(dt=0.05, config={"determinism_mode": legacy_mode})
-    )
+    response = adapter.init(InitRequest(dt=0.05, config={"determinism_mode": legacy_mode}))
 
-    assert (
-        response.metadata["config"]["allow_async_world_lifecycle"]
-        is expected_async
-    )
+    assert response.metadata["config"]["allow_async_world_lifecycle"] is expected_async
 
 
 def test_init_failure_returns_no_response_and_preserves_exception(monkeypatch) -> None:
