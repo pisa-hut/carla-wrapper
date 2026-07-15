@@ -21,6 +21,7 @@ def force_async_world_for_cleanup(
     *,
     client: Any = None,
     traffic_manager_port: int = 8000,
+    keep_synchronous: bool = False,
     log: logging.Logger = logger,
 ) -> None:
     if world is None:
@@ -29,25 +30,42 @@ def force_async_world_for_cleanup(
     try:
         settings = world.get_settings()
         changed = False
-        if getattr(settings, "synchronous_mode", False):
+        if keep_synchronous and not getattr(settings, "synchronous_mode", False):
+            settings.synchronous_mode = True
+            changed = True
+        elif not keep_synchronous and getattr(settings, "synchronous_mode", False):
             settings.synchronous_mode = False
             changed = True
-        if getattr(settings, "fixed_delta_seconds", None) is not None:
+        if (
+            not keep_synchronous
+            and getattr(settings, "fixed_delta_seconds", None) is not None
+        ):
             settings.fixed_delta_seconds = None
+            changed = True
+        # An asynchronous world advances without client ticks. If rendering is
+        # left enabled between episodes, an otherwise idle CARLA server renders
+        # as fast as possible and can saturate the GPU. The next reset restores
+        # the configured rendering mode before the scenario starts.
+        if not getattr(settings, "no_rendering_mode", False):
+            settings.no_rendering_mode = True
             changed = True
         if changed:
             world.apply_settings(settings)
-            log.info("Forced CARLA world to async mode for cleanup")
+            mode = "synchronous" if keep_synchronous else "asynchronous"
+            log.info("Prepared CARLA world in %s no-rendering mode for cleanup", mode)
     except Exception:
-        log.exception("Failed to force CARLA world to async mode for cleanup")
+        log.exception("Failed to configure CARLA world for cleanup")
 
     if client is None:
         return
 
     try:
-        client.get_trafficmanager(traffic_manager_port).set_synchronous_mode(False)
+        client.get_trafficmanager(traffic_manager_port).set_synchronous_mode(
+            keep_synchronous
+        )
     except Exception:
-        log.exception("Failed to force TrafficManager to async mode for cleanup")
+        mode = "synchronous" if keep_synchronous else "asynchronous"
+        log.exception("Failed to set TrafficManager %s mode for cleanup", mode)
 
 
 def clear_dynamic_actors(
@@ -55,6 +73,7 @@ def clear_dynamic_actors(
     *,
     client: Any = None,
     traffic_manager_port: int = 8000,
+    keep_synchronous: bool = False,
     log: logging.Logger = logger,
 ) -> int:
     if world is None:
@@ -64,11 +83,15 @@ def clear_dynamic_actors(
         world,
         client=client,
         traffic_manager_port=traffic_manager_port,
+        keep_synchronous=keep_synchronous,
         log=log,
     )
 
     try:
-        actors = list(world.get_actors())
+        actors = sorted(
+            world.get_actors(),
+            key=lambda actor: getattr(actor, "id", -1),
+        )
     except Exception:
         log.exception("Failed to list CARLA actors for reset cleanup")
         return 0

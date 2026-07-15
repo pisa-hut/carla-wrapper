@@ -7,10 +7,6 @@
 # CARLA world execution
 # -----------------------------------------------------------------------------
 
-# Enable CARLA synchronous mode for deterministic stepping.
-# Recommended for simulator API usage because step() drives the world tick.
-synchronous_mode: true
-
 # Disable rendering on the CARLA server side.
 # Use true for faster headless runs when camera/display rendering is not needed.
 no_rendering_mode: true
@@ -19,14 +15,32 @@ no_rendering_mode: true
 # Set true to enable recording (writes carla_recording.log).
 record: false
 
+# Scenarios always run synchronously. Cleanup and world loading remain synchronous
+# by default. Set true only as a compatibility escape hatch; scenario execution
+# remains synchronous even when lifecycle operations are asynchronous.
+allow_async_world_lifecycle: false
+
+# Control the expensive world reload independently from lifecycle synchronization.
+# - null (default): disabled.
+# - true/false: explicitly enable or disable it.
+# A newly started server's first episode and a freshly generated OpenDRIVE world
+# are already clean and therefore skip the redundant reload.
+reload_world_between_episodes: null
+
+# Explicit physics substepping. These defaults match CARLA's recommended values
+# and add no extra work compared with CARLA's default physics configuration.
+physics_substepping: true
+physics_max_substep_delta_seconds: 0.01
+physics_max_substeps: 10
+
 # Select who loads the map for open_scenario1 scenarios.
-# - scenario_runner: preserve ScenarioRunner's native LogicFile loading behavior.
-# - wrapper: generate /mnt/map/xodr/<ScenarioPackData.map_name>.xodr with
+# - wrapper (default): generate /mnt/map/xodr/<ScenarioPackData.map_name>.xodr with
 #   wall_height=0.0 before parsing the OpenSCENARIO file. ScenarioRunner is then
 #   allowed to verify the map but not replace the world. The first reset after
 #   init generates it; later resets reuse it only after verifying the current
 #   OpenDRIVE content.
-open_scenario_map_loader: scenario_runner
+# - scenario_runner: preserve ScenarioRunner's native LogicFile loading behavior.
+open_scenario_map_loader: wrapper
 
 # -----------------------------------------------------------------------------
 # Coordinate convention
@@ -55,8 +69,8 @@ retry_interval_seconds: 2
 # TrafficManager
 # -----------------------------------------------------------------------------
 
-# Random seed passed to CARLA TrafficManager when ScenarioRunner is started.
-# Use a fixed value for reproducible traffic behavior.
+# Episode seed passed to Python, NumPy, ScenarioRunner, pedestrians, and CARLA
+# TrafficManager. Use a fixed value for reproducible scenario behavior.
 scenario_runner_tm_seed: 0
 
 # -----------------------------------------------------------------------------

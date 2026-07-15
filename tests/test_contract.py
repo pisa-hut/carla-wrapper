@@ -121,7 +121,13 @@ def test_init_returns_round_trippable_component_metadata(monkeypatch) -> None:
     assert response.metadata["client_version"] == "0.9.16-client"
     assert response.metadata["server_version"] == "0.9.16-server"
     assert response.metadata["traffic_manager_port"] == 8000
+    assert response.metadata["config"]["synchronous_mode"] is True
     assert response.metadata["config"]["no_rendering_mode"] is True
+    assert response.metadata["config"]["allow_async_world_lifecycle"] is False
+    assert response.metadata["config"]["reload_world_between_episodes"] is False
+    assert response.metadata["config"]["physics_substepping"] is True
+    assert response.metadata["config"]["physics_max_substep_delta_seconds"] == 0.01
+    assert response.metadata["config"]["physics_max_substeps"] == 10
     assert response.metadata["config"]["kinematic_speed_deadband_mps"] == 0.02
     assert response.metadata["config"]["ackermann_speed_kp"] == 0.5
     assert response.metadata["config"]["ackermann_brake_jerk_default"] == 8.0
@@ -130,6 +136,45 @@ def test_init_returns_round_trippable_component_metadata(monkeypatch) -> None:
     assert _is_safe_struct_value(response.metadata)
     assert init_response_from_proto(init_response_to_proto(response)) == response
     assert calls == ["connect", "prepare"]
+
+
+@pytest.mark.parametrize(
+    ("reload_value", "expected"),
+    [(None, False), (False, False), (True, True)],
+)
+def test_reload_world_requires_explicit_opt_in(monkeypatch, reload_value, expected) -> None:
+    adapter, _ = _initialized_adapter(monkeypatch)
+
+    response = adapter.init(
+        InitRequest(
+            dt=0.05,
+            config={
+                "reload_world_between_episodes": reload_value,
+            },
+        )
+    )
+
+    assert response.metadata["config"]["allow_async_world_lifecycle"] is False
+    assert response.metadata["config"]["reload_world_between_episodes"] is expected
+
+
+@pytest.mark.parametrize(
+    ("legacy_mode", "expected_async"),
+    [("strict", False), ("standard", True)],
+)
+def test_legacy_determinism_mode_maps_to_lifecycle_option(
+    monkeypatch, legacy_mode, expected_async
+) -> None:
+    adapter, _ = _initialized_adapter(monkeypatch)
+
+    response = adapter.init(
+        InitRequest(dt=0.05, config={"determinism_mode": legacy_mode})
+    )
+
+    assert (
+        response.metadata["config"]["allow_async_world_lifecycle"]
+        is expected_async
+    )
 
 
 def test_init_failure_returns_no_response_and_preserves_exception(monkeypatch) -> None:

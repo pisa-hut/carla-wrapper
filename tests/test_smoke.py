@@ -1,6 +1,7 @@
 """Smoke tests for the pisa-api simulator-friendly contract."""
 
 import ast
+import logging
 import math
 from io import StringIO
 from pathlib import Path
@@ -28,7 +29,9 @@ def _parse_flat_yaml_config(path: Path) -> dict[str, object]:
             continue
         key, raw_value = (part.strip() for part in line.split(":", 1))
         lowered = raw_value.lower()
-        if lowered in {"true", "false"}:
+        if lowered in {"null", "none", "~"}:
+            value = None
+        elif lowered in {"true", "false"}:
             value = lowered == "true"
         else:
             try:
@@ -375,6 +378,7 @@ def test_finalize_clears_dynamic_actors_and_leaves_server_async() -> None:
     )
     adapter._world = world
     adapter._scenario_runner_tm_port = 8000
+    adapter._allow_async_world_lifecycle = True
     adapter._destroy_spawned_actors = lambda: None
     adapter._stop_scenario_runner_module = lambda: None
 
@@ -384,9 +388,51 @@ def test_finalize_clears_dynamic_actors_and_leaves_server_async() -> None:
     assert traffic_light.destroy_calls == 0
     assert world.settings.synchronous_mode is False
     assert world.settings.fixed_delta_seconds is None
+    assert world.settings.no_rendering_mode is True
     assert world.applied_settings is world.settings
     assert traffic_manager.sync_calls == [False]
     assert adapter._finalized is True
+
+
+def test_strict_cleanup_keeps_world_and_traffic_manager_synchronous() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    vehicle = _FakeActor(actor_id=1, type_id="vehicle.tesla.model3")
+    world = _FakeSettingsWorld(
+        [vehicle], synchronous_mode=True, fixed_delta_seconds=0.05
+    )
+    traffic_manager = _FakeTrafficManager()
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._allow_async_world_lifecycle = False
+    adapter._world = world
+    adapter._client = SimpleNamespace(
+        get_trafficmanager=lambda port: traffic_manager,
+    )
+    adapter._scenario_runner_tm_port = 8000
+
+    adapter._clear_dynamic_actors()
+
+    assert vehicle.destroy_calls == 1
+    assert world.settings.synchronous_mode is True
+    assert world.settings.fixed_delta_seconds == 0.05
+    assert world.settings.no_rendering_mode is True
+    assert traffic_manager.sync_calls == [True]
+
+
+def test_strict_cleanup_does_not_restore_traffic_manager_to_async() -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    traffic_manager = _FakeTrafficManager()
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._allow_async_world_lifecycle = False
+    adapter._traffic_manager = traffic_manager
+    adapter._traffic_manager_sync_enabled = True
+
+    adapter._restore_traffic_manager_settings()
+
+    assert traffic_manager.sync_calls == []
+    assert adapter._traffic_manager is None
+    assert adapter._traffic_manager_sync_enabled is False
 
 
 def test_init_finalizes_previous_run_and_prepares_reused_server() -> None:
@@ -540,12 +586,50 @@ def test_init_rejects_unknown_open_scenario_map_loader() -> None:
 @pytest.mark.parametrize(
     ("config", "dt", "message"),
     [
-        ({"synchronous_mode": False}, 0.05, "synchronous_mode must be true"),
+        ({"synchronous_mode": False}, 0.05, "synchronous_mode is deprecated"),
         ({"yaw_sign": 1.0}, 0.05, "canonical coordinates"),
         ({"yaw_offset_deg": 1.0}, 0.05, "canonical coordinates"),
         ({}, 0.0, "finite positive"),
         ({}, float("nan"), "finite positive"),
         ({"ackermann_native_speed_kp": float("inf")}, 0.05, "finite number"),
+        ({"determinism_mode": "unknown"}, 0.05, "Invalid determinism_mode"),
+        (
+            {"allow_async_world_lifecycle": "sometimes"},
+            0.05,
+            "allow_async_world_lifecycle must be true or false",
+        ),
+        (
+            {"allow_async_world_lifecycle": None},
+            0.05,
+            "allow_async_world_lifecycle must be true or false",
+        ),
+        (
+            {
+                "determinism_mode": "strict",
+                "allow_async_world_lifecycle": True,
+            },
+            0.05,
+            "determinism_mode conflicts",
+        ),
+        (
+            {"reload_world_between_episodes": "sometimes"},
+            0.05,
+            "reload_world_between_episodes must be true, false, or null",
+        ),
+        (
+            {"physics_substepping": False},
+            0.05,
+            "requires physics_substepping=true",
+        ),
+        (
+            {
+                "physics_max_substep_delta_seconds": 0.01,
+                "physics_max_substeps": 10,
+            },
+            0.11,
+            "exceeds physics substepping capacity",
+        ),
+        ({"scenario_runner_tm_seed": -1}, 0.05, "between 0 and"),
     ],
 )
 def test_init_rejects_noncanonical_runtime_config(config, dt, message) -> None:
@@ -580,12 +664,14 @@ def test_prepare_reused_server_forces_async_and_clears_dynamic_actors() -> None:
     adapter = CarlaAdapter.__new__(CarlaAdapter)
     adapter._client = _FakeClient(world, traffic_manager=traffic_manager)
     adapter._scenario_runner_tm_port = 8000
+    adapter._allow_async_world_lifecycle = True
 
     adapter._prepare_reused_server_state()
 
     assert adapter._world is world
     assert world.settings.synchronous_mode is False
     assert world.settings.fixed_delta_seconds is None
+    assert world.settings.no_rendering_mode is True
     assert world.applied_settings is world.settings
     assert traffic_manager.sync_calls == [False]
     assert vehicle.destroy_calls == 1
@@ -863,6 +949,64 @@ def test_collision_details_include_episode_relative_time() -> None:
     assert adapter._actor_ref(99).role == ActorRole.ACTOR_ROLE_UNSPECIFIED
 
 
+@pytest.mark.parametrize("allow_async_lifecycle", [False, True])
+def test_collision_events_ignore_world_lifecycle_mode(allow_async_lifecycle) -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    def event(frame, other_actor_id):
+        return {
+            "frame": frame,
+            "timestamp": frame * 0.05,
+            "actor_id": 1,
+            "other_actor_id": other_actor_id,
+            "other_actor_type_id": "vehicle.test",
+            "other_actor_semantic_tags": [],
+            "normal_impulse": {"x": 1.0, "y": 0.0, "z": 0.0},
+        }
+
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._allow_async_world_lifecycle = allow_async_lifecycle
+    adapter._episode_start_carla_time_ns = 0
+    adapter._episode_start_carla_frame = 0
+    adapter._collision_lock = _FakeLock()
+    adapter._collision_events = [event(12, 3), event(11, 4), event(11, 2)]
+    adapter._ego_vehicle = SimpleNamespace(id=1)
+    adapter._actor_metadata_by_id = {}
+
+    first = adapter._collect_collision_infos()
+    assert [collision.actor_b.tracking_id for collision in first] == [2, 4, 3]
+    assert list(adapter._collision_events) == []
+
+
+def test_episode_seed_resets_python_numpy_and_scenario_runner_rng(monkeypatch) -> None:
+    import random
+
+    import numpy as np
+
+    from carla_wrapper import simulation
+
+    fake_data_provider = SimpleNamespace()
+    monkeypatch.setattr(simulation, "CarlaDataProvider", fake_data_provider)
+    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
+    adapter._scenario_runner_tm_seed = 17
+
+    adapter._reset_random_sources()
+    first = (
+        random.random(),
+        np.random.random(),
+        fake_data_provider._rng.random_sample(),
+    )
+    adapter._reset_random_sources()
+    second = (
+        random.random(),
+        np.random.random(),
+        fake_data_provider._rng.random_sample(),
+    )
+
+    assert first == second
+    assert fake_data_provider._random_seed == 17
+
+
 def test_collision_rejects_non_finite_impulse() -> None:
     from carla_wrapper.simulation import CarlaAdapter
 
@@ -895,12 +1039,13 @@ def test_reset_finalizes_partial_state_on_failure(tmp_path) -> None:
     adapter._finalized = True
     adapter._output_base = tmp_path
     adapter.scenario = SimpleNamespace(format="carla_lb_route")
+    adapter._allow_async_world_lifecycle = True
     adapter._clear_collision_events = lambda: calls.append("clear_collision_events")
     adapter._ensure_world = lambda scenario_pack, generate_opendrive_world=True: calls.append(
         ("ensure_world", scenario_pack, generate_opendrive_world)
     )
     adapter._clear_dynamic_actors = lambda: calls.append("clear_dynamic_actors")
-    adapter._apply_world_settings = lambda: calls.append("apply_world_settings")
+    adapter._prepare_world_for_scenario = lambda **kwargs: calls.append("prepare_world")
     adapter._client = SimpleNamespace(start_recorder=lambda path: calls.append(("recorder", path)))
 
     def start_scenario_runner(scenario_pack, params):
@@ -915,7 +1060,11 @@ def test_reset_finalizes_partial_state_on_failure(tmp_path) -> None:
         adapter.reset(request)
 
     assert calls[-1] == "finalize"
-    assert calls[1][0] == "ensure_world"
+    assert calls[1:4] == [
+        "clear_dynamic_actors",
+        ("ensure_world", request.scenario_pack, True),
+        "prepare_world",
+    ]
 
 
 def test_reset_marks_negative_initial_speed_as_precondition_failure(tmp_path) -> None:
@@ -926,6 +1075,7 @@ def test_reset_marks_negative_initial_speed_as_precondition_failure(tmp_path) ->
     adapter._finalized = True
     adapter._output_base = tmp_path
     adapter.scenario = SimpleNamespace(format="open_scenario1")
+    adapter._allow_async_world_lifecycle = True
     adapter._open_scenario_map_loader = "scenario_runner"
     adapter._clear_collision_events = lambda: None
     adapter._ensure_world = lambda *args, **kwargs: None
@@ -950,6 +1100,7 @@ def test_reset_does_not_reclassify_unrecognized_attribute_error(tmp_path) -> Non
     adapter._finalized = True
     adapter._output_base = tmp_path
     adapter.scenario = SimpleNamespace(format="open_scenario1")
+    adapter._allow_async_world_lifecycle = True
     adapter._open_scenario_map_loader = "scenario_runner"
     adapter._clear_collision_events = lambda: None
     adapter._ensure_world = lambda *args, **kwargs: None
@@ -974,6 +1125,7 @@ def test_open_scenario_wrapper_map_loader_generates_world_before_scenario_runner
     adapter._output_base = tmp_path
     adapter.scenario = SimpleNamespace(format="open_scenario1")
     adapter._open_scenario_map_loader = "wrapper"
+    adapter._allow_async_world_lifecycle = True
     adapter._clear_collision_events = lambda: None
     adapter._ensure_world = lambda scenario_pack, generate_opendrive_world=True: calls.append(
         ("ensure_world", generate_opendrive_world)
@@ -990,11 +1142,71 @@ def test_open_scenario_wrapper_map_loader_generates_world_before_scenario_runner
         adapter.reset(request)
 
     assert calls[:3] == [
-        ("ensure_world", True),
         "clear_dynamic_actors",
+        ("ensure_world", True),
         "apply_world_settings",
     ]
+    assert calls.count("apply_world_settings") == 1
     assert calls[-1] == "finalize"
+
+
+def test_strict_mode_enables_sync_before_wrapper_world_generation(tmp_path) -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    calls = []
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._finalized = True
+    adapter._output_base = tmp_path
+    adapter.scenario = SimpleNamespace(format="open_scenario1")
+    adapter._open_scenario_map_loader = "wrapper"
+    adapter._allow_async_world_lifecycle = False
+    adapter._clear_collision_events = lambda: None
+    adapter._clear_dynamic_actors = lambda: calls.append("clear_dynamic_actors")
+    adapter._apply_world_settings = lambda: calls.append("apply_world_settings")
+    adapter._ensure_world = lambda *args, **kwargs: calls.append("ensure_world")
+    adapter._start_scenario_runner = lambda *args, **kwargs: (_ for _ in ()).throw(
+        RuntimeError("stop after map preparation")
+    )
+    adapter._finalize = lambda: calls.append("finalize")
+
+    with pytest.raises(RuntimeError, match="stop after map preparation"):
+        adapter.reset(SimpleNamespace(output_dir="run", scenario_pack=object(), params={}))
+
+    assert calls[:4] == [
+        "clear_dynamic_actors",
+        "apply_world_settings",
+        "ensure_world",
+        "apply_world_settings",
+    ]
+
+
+def test_strict_mode_enables_sync_before_scenario_runner_world_loading(tmp_path) -> None:
+    from carla_wrapper.simulation import CarlaAdapter
+
+    calls = []
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._finalized = True
+    adapter._output_base = tmp_path
+    adapter.scenario = SimpleNamespace(format="open_scenario1")
+    adapter._open_scenario_map_loader = "scenario_runner"
+    adapter._allow_async_world_lifecycle = False
+    adapter._clear_collision_events = lambda: None
+    adapter._clear_dynamic_actors = lambda: calls.append("clear_dynamic_actors")
+    adapter._apply_world_settings = lambda: calls.append("apply_world_settings")
+    adapter._ensure_world = lambda *args, **kwargs: calls.append("ensure_world")
+    adapter._start_scenario_runner = lambda *args, **kwargs: (_ for _ in ()).throw(
+        RuntimeError("stop after world loading begins")
+    )
+    adapter._finalize = lambda: calls.append("finalize")
+
+    with pytest.raises(RuntimeError, match="stop after world loading begins"):
+        adapter.reset(SimpleNamespace(output_dir="run", scenario_pack=object(), params={}))
+
+    assert calls[:3] == [
+        "clear_dynamic_actors",
+        "apply_world_settings",
+        "ensure_world",
+    ]
 
 
 def test_open_scenario_reset_delegates_world_loading_to_scenario_runner(tmp_path) -> None:
@@ -1009,6 +1221,8 @@ def test_open_scenario_reset_delegates_world_loading_to_scenario_runner(tmp_path
     adapter._finalized = True
     adapter._output_base = tmp_path
     adapter.scenario = SimpleNamespace(format="open_scenario1")
+    adapter._open_scenario_map_loader = "scenario_runner"
+    adapter._allow_async_world_lifecycle = True
     adapter._sync = True
     ego_vehicle = _FakeKinematicActor(11)
     other_vehicle = _FakeKinematicActor(12)
@@ -1064,6 +1278,7 @@ def test_open_scenario_reset_delegates_world_loading_to_scenario_runner(tmp_path
     response = adapter.reset(request)
 
     assert ("ensure_world", False) in calls
+    assert calls.index("clear_dynamic_actors") < calls.index(("ensure_world", False))
     assert "apply_world_settings" not in calls
     assert calls.index("start_scenario_runner") < calls.index("start_recorder")
     assert calls.index("start_recorder") < calls.index("setup_collision_sensor")
@@ -1104,6 +1319,7 @@ def test_route_reset_frame_starts_at_zero_after_initialization_tick(tmp_path) ->
     adapter._finalized = True
     adapter._output_base = tmp_path
     adapter.scenario = SimpleNamespace(format="carla_lb_route")
+    adapter._allow_async_world_lifecycle = True
     adapter._sync = True
     adapter._record = False
     adapter._world = world
@@ -1117,7 +1333,7 @@ def test_route_reset_frame_starts_at_zero_after_initialization_tick(tmp_path) ->
     adapter._clear_collision_events = lambda: None
     adapter._ensure_world = lambda *args, **kwargs: None
     adapter._clear_dynamic_actors = lambda: None
-    adapter._apply_world_settings = lambda: None
+    adapter._prepare_world_for_scenario = lambda **kwargs: None
     adapter._start_scenario_runner = lambda *args, **kwargs: None
     adapter._setup_collision_sensor = lambda: None
     adapter._tick_scenario_runner_module = lambda: None
@@ -1139,10 +1355,11 @@ def test_ensure_world_can_skip_opendrive_generation() -> None:
     adapter._server_version = "test"
     adapter._client = _FakeClient(world)
 
-    adapter._ensure_world(SimpleNamespace(), generate_opendrive_world=False)
+    generated = adapter._ensure_world(SimpleNamespace(), generate_opendrive_world=False)
 
     assert adapter._world is world
     assert adapter._client.generated is False
+    assert generated is False
 
 
 def test_ensure_world_generates_opendrive_without_walls(monkeypatch) -> None:
@@ -1162,9 +1379,10 @@ def test_ensure_world_generates_opendrive_without_walls(monkeypatch) -> None:
         def set_timeout(self, timeout):
             self.timeouts.append(timeout)
 
-        def generate_opendrive_world(self, opendrive, parameters):
+        def generate_opendrive_world(self, opendrive, parameters, reset_settings):
             assert opendrive == "<OpenDRIVE/>"
             assert isinstance(parameters, FakeGenerationParameters)
+            assert reset_settings is False
             return generated_world
 
     monkeypatch.setattr(
@@ -1178,9 +1396,10 @@ def test_ensure_world_generates_opendrive_without_walls(monkeypatch) -> None:
     adapter._server_version = "test"
     adapter._client = FakeClient()
 
-    adapter._ensure_world(SimpleNamespace(map_name="test_map"))
+    generated = adapter._ensure_world(SimpleNamespace(map_name="test_map"))
 
     assert adapter._world is generated_world
+    assert generated is True
     assert generation_parameters[0]["wall_height"] == 0.0
     assert adapter._client.timeouts == [300.0, 30.0]
     assert adapter._wrapper_loaded_opendrive_digest == adapter._opendrive_digest("<OpenDRIVE/>")
@@ -1217,10 +1436,11 @@ def test_ensure_world_reuses_verified_wrapper_generated_opendrive(monkeypatch) -
     adapter._client = FakeClient()
     adapter._wrapper_loaded_opendrive_digest = adapter._opendrive_digest(opendrive)
 
-    adapter._ensure_world(SimpleNamespace(map_name="map_a"))
+    generated = adapter._ensure_world(SimpleNamespace(map_name="map_a"))
 
     assert adapter._world is world
     assert adapter._client.generate_calls == 0
+    assert generated is False
 
 
 def test_ensure_world_switches_between_different_opendrive_maps_with_same_carla_name(
@@ -1251,9 +1471,10 @@ def test_ensure_world_switches_between_different_opendrive_maps_with_same_carla_
         def set_timeout(self, timeout):
             self.timeouts.append(timeout)
 
-        def generate_opendrive_world(self, opendrive, _parameters):
+        def generate_opendrive_world(self, opendrive, _parameters, reset_settings):
             self.generate_calls += 1
             assert opendrive == new_opendrive
+            assert reset_settings is False
             return generated_world
 
     monkeypatch.setattr(
@@ -1405,10 +1626,11 @@ def test_open_scenario_uses_scenario_runner_reloaded_world(monkeypatch) -> None:
     )
     monkeypatch.setattr(simulation.Path, "exists", lambda self: True)
 
+    traffic_manager = _FakeTrafficManager()
     adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
     adapter._client = SimpleNamespace(
         get_world=lambda: new_world,
-        get_trafficmanager=lambda port: _FakeTrafficManager(),
+        get_trafficmanager=lambda port: traffic_manager,
     )
     adapter._world = old_world
     adapter._scenario_runner_tm_port = 8000
@@ -1429,6 +1651,7 @@ def test_open_scenario_uses_scenario_runner_reloaded_world(monkeypatch) -> None:
     assert ("open_scenario", new_world, True) in calls
     assert new_world.tick_calls == 1
     assert old_world.tick_calls == 0
+    assert traffic_manager.calls == [("sync", True), ("seed", 0)]
     set_world_calls = [call for call in calls if call[0] == "set_world"]
     assert set_world_calls[-1] == ("set_world", new_world, True)
 
@@ -1540,6 +1763,7 @@ def test_restore_traffic_manager_disables_sync_when_wrapper_enabled_it() -> None
     adapter = CarlaAdapter.__new__(CarlaAdapter)
     adapter._traffic_manager = traffic_manager
     adapter._traffic_manager_sync_enabled = True
+    adapter._allow_async_world_lifecycle = True
 
     adapter._restore_traffic_manager_settings()
 
@@ -1709,12 +1933,15 @@ class _FakeTrafficManager:
     def __init__(self):
         self.sync_calls = []
         self.seed_calls = []
+        self.calls = []
 
     def set_synchronous_mode(self, enabled):
         self.sync_calls.append(enabled)
+        self.calls.append(("sync", enabled))
 
     def set_random_device_seed(self, seed):
         self.seed_calls.append(seed)
+        self.calls.append(("seed", seed))
 
 
 class _FakeSharedState:
@@ -1784,6 +2011,161 @@ class _FakeClient:
     def generate_opendrive_world(self, *args, **kwargs):
         self.generated = True
         raise AssertionError("generate_opendrive_world should not be called")
+
+
+class _DeterminismWorld(_FakeSettingsWorld):
+    def __init__(self, map_name="Town01", **kwargs):
+        super().__init__(**kwargs)
+        self.settings.substepping = True
+        self.settings.max_substep_delta_time = 0.01
+        self.settings.max_substeps = 10
+        self.settings.deterministic_ragdolls = False
+        self.map_name = map_name
+        self.pedestrian_seed_calls = []
+
+    def get_map(self):
+        return SimpleNamespace(name=self.map_name)
+
+    def set_pedestrians_seed(self, seed):
+        self.pedestrian_seed_calls.append(seed)
+
+
+def _determinism_adapter(world, client, mode="standard"):
+    from carla_wrapper.simulation import CarlaAdapter
+
+    adapter = CarlaAdapter.__new__(CarlaAdapter)
+    adapter._world = world
+    adapter._client = client
+    adapter._sync = True
+    adapter._no_rendering = True
+    adapter._fixed_delta_seconds = 0.05
+    adapter._physics_substepping = True
+    adapter._physics_max_substep_delta_seconds = 0.01
+    adapter._physics_max_substeps = 10
+    adapter._allow_async_world_lifecycle = mode == "standard"
+    adapter._reload_world_between_episodes = mode == "strict"
+    adapter._successful_reset_count = 0
+    adapter._world_generated_for_reset = False
+    adapter._scenario_runner_tm_seed = 42
+    adapter._scenario_runner_tm_port = 8000
+    return adapter
+
+
+def test_standard_determinism_prepares_world_without_reload_or_registration(monkeypatch) -> None:
+    from carla_wrapper import simulation
+
+    world = _DeterminismWorld()
+    client = _FakeClient(world)
+    calls = []
+    monkeypatch.setattr(
+        simulation,
+        "CarlaDataProvider",
+        SimpleNamespace(
+            set_client=lambda value: calls.append(("client", value)),
+            set_world=lambda value: calls.append(("world", value)),
+        ),
+    )
+    adapter = _determinism_adapter(world, client)
+
+    adapter._prepare_world_for_scenario(register_data_provider=False)
+
+    assert world.settings.synchronous_mode is True
+    assert world.settings.fixed_delta_seconds == 0.05
+    assert world.settings.substepping is True
+    assert world.pedestrian_seed_calls == [42]
+    assert calls == []
+
+
+def test_strict_determinism_reloads_once_and_preserves_settings(monkeypatch) -> None:
+    from carla_wrapper import simulation
+
+    old_world = _DeterminismWorld()
+    new_world = _DeterminismWorld(
+        synchronous_mode=True,
+        fixed_delta_seconds=0.05,
+    )
+    new_world.settings.no_rendering_mode = True
+    new_world.settings.deterministic_ragdolls = True
+    traffic_manager = _FakeTrafficManager()
+
+    class ReloadingClient(_FakeClient):
+        def __init__(self):
+            super().__init__(old_world, traffic_manager=traffic_manager)
+            self.reload_calls = []
+
+        def reload_world(self, reset_settings):
+            self.reload_calls.append(reset_settings)
+            self.world = new_world
+            return new_world
+
+    client = ReloadingClient()
+    calls = []
+    monkeypatch.setattr(
+        simulation,
+        "CarlaDataProvider",
+        SimpleNamespace(
+            set_client=lambda value: calls.append(("client", value)),
+            set_world=lambda value: calls.append(("world", value)),
+        ),
+    )
+    adapter = _determinism_adapter(old_world, client, mode="strict")
+    adapter._successful_reset_count = 1
+
+    adapter._prepare_world_for_scenario(register_data_provider=False)
+
+    assert client.reload_calls == [False]
+    assert adapter._world is new_world
+    assert traffic_manager.sync_calls == [False]
+    assert new_world.pedestrian_seed_calls == [42]
+    assert calls[-1] == ("world", new_world)
+
+
+@pytest.mark.parametrize(
+    ("successful_reset_count", "world_generated", "reason"),
+    [(0, False, "first episode"), (1, True, "freshly generated world")],
+)
+def test_strict_skips_redundant_reload_for_clean_world(
+    monkeypatch, caplog, successful_reset_count, world_generated, reason
+) -> None:
+    from carla_wrapper import simulation
+
+    world = _DeterminismWorld()
+    client = _FakeClient(world)
+    monkeypatch.setattr(
+        simulation,
+        "CarlaDataProvider",
+        SimpleNamespace(set_client=lambda value: None, set_world=lambda value: None),
+    )
+    adapter = _determinism_adapter(world, client, mode="strict")
+    adapter._successful_reset_count = successful_reset_count
+    adapter._world_generated_for_reset = world_generated
+    caplog.set_level(logging.INFO)
+
+    adapter._prepare_world_for_scenario(register_data_provider=False)
+
+    assert reason in caplog.text
+    assert world.pedestrian_seed_calls == [42]
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_exception"),
+    [
+        (RuntimeError("time-out while loading"), SimulatorTimeout),
+        (RuntimeError("server disconnected"), SimulatorUnavailable),
+    ],
+)
+def test_strict_reload_classifies_temporary_server_failures(error, expected_exception) -> None:
+    world = _DeterminismWorld()
+
+    class FailingClient(_FakeClient):
+        def reload_world(self, reset_settings):
+            raise error
+
+    adapter = _determinism_adapter(world, FailingClient(world), mode="strict")
+    adapter._apply_world_settings()
+
+    with pytest.raises(expected_exception):
+        adapter._reload_world_for_determinism()
 
 
 def test_throttle_steer_brake_preserves_brake_and_gives_it_priority(monkeypatch) -> None:

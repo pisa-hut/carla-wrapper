@@ -2,6 +2,7 @@ import hashlib
 import logging
 import math
 import os
+import random
 import subprocess
 import time
 import weakref
@@ -10,6 +11,7 @@ from numbers import Real
 from pathlib import Path
 from threading import Lock
 
+import numpy as np
 from pisa_api.simulator import (
     ActorRefData,
     ActorRole,
@@ -96,10 +98,14 @@ def _is_non_runnable_scenario_error(exc: BaseException) -> bool:
 
 
 DEFAULT_CONFIG = {
-    "synchronous_mode": True,
     "no_rendering_mode": True,
     "record": False,
-    "open_scenario_map_loader": "scenario_runner",
+    "allow_async_world_lifecycle": False,
+    "reload_world_between_episodes": None,
+    "physics_substepping": True,
+    "physics_max_substep_delta_seconds": 0.01,
+    "physics_max_substeps": 10,
+    "open_scenario_map_loader": "wrapper",
     "yaw_sign": -1.0,
     "yaw_offset_deg": 0.0,
     "carla_connect_timeout_seconds": 40,
@@ -134,6 +140,7 @@ DEFAULT_CONFIG = {
 
 
 _OPEN_SCENARIO_MAP_LOADERS = {"scenario_runner", "wrapper"}
+_DETERMINISM_MODES = {"standard", "strict"}
 
 _NONNEGATIVE_FINITE_CONFIG_KEYS = {
     "kinematic_speed_deadband_mps",
@@ -276,6 +283,8 @@ class CarlaAdapter:
         self._initial_speed_overrides: dict[int, float] = {}
         self._quit_msg = ""
         self._server_process = None
+        self._successful_reset_count = 0
+        self._world_generated_for_reset = False
 
         self._server_log_path = "/mnt/output/carla_server"
         os.makedirs(self._server_log_path, exist_ok=True)
@@ -308,7 +317,7 @@ class CarlaAdapter:
 
         try:
             self._fixed_delta_seconds = float(request.dt)
-        except (TypeError, ValueError) as exc:
+        except (OverflowError, TypeError, ValueError) as exc:
             raise InvalidSimulatorRequest("Init.dt must be a finite positive number") from exc
         if not math.isfinite(self._fixed_delta_seconds) or self._fixed_delta_seconds <= 0.0:
             raise InvalidSimulatorRequest("Init.dt must be a finite positive number")
@@ -316,15 +325,100 @@ class CarlaAdapter:
         if self._dt_ns <= 0:
             raise InvalidSimulatorRequest("Init.dt is too small to represent in nanoseconds")
 
-        self._sync = bool(self._config_value("synchronous_mode"))
+        raw_sync = (self.config or {}).get("synchronous_mode", True)
+        if raw_sync is not True:
+            raise InvalidSimulatorRequest(
+                "synchronous_mode is deprecated and, when provided, must be true"
+            )
+        self._sync = True
         self._no_rendering = bool(self._config_value("no_rendering_mode"))
         self._record = bool(self._config_value("record"))
+        config = self.config or {}
+        legacy_mode = config.get("determinism_mode")
+        if legacy_mode is not None:
+            legacy_mode = str(legacy_mode).strip().lower()
+            if legacy_mode not in _DETERMINISM_MODES:
+                choices = ", ".join(sorted(_DETERMINISM_MODES))
+                raise InvalidSimulatorRequest(
+                    f"Invalid determinism_mode '{legacy_mode}'; expected one of: {choices}"
+                )
+        if "allow_async_world_lifecycle" in config:
+            raw_async_lifecycle = config["allow_async_world_lifecycle"]
+        elif legacy_mode is not None:
+            raw_async_lifecycle = None
+        else:
+            raw_async_lifecycle = self._config_value("allow_async_world_lifecycle")
+        if raw_async_lifecycle is None:
+            if "allow_async_world_lifecycle" in config:
+                raise InvalidSimulatorRequest(
+                    "allow_async_world_lifecycle must be true or false"
+                )
+            self._allow_async_world_lifecycle = legacy_mode == "standard"
+        elif isinstance(raw_async_lifecycle, bool):
+            self._allow_async_world_lifecycle = raw_async_lifecycle
+        else:
+            raise InvalidSimulatorRequest(
+                "allow_async_world_lifecycle must be true or false"
+            )
+        if legacy_mode is not None:
+            legacy_async_lifecycle = legacy_mode == "standard"
+            if (
+                raw_async_lifecycle is not None
+                and self._allow_async_world_lifecycle != legacy_async_lifecycle
+            ):
+                raise InvalidSimulatorRequest(
+                    "determinism_mode conflicts with allow_async_world_lifecycle"
+                )
+            logger.warning(
+                "determinism_mode is deprecated; use allow_async_world_lifecycle=%s",
+                legacy_async_lifecycle,
+            )
+        raw_reload_world = self._config_value("reload_world_between_episodes")
+        if raw_reload_world is None:
+            self._reload_world_between_episodes = False
+        elif isinstance(raw_reload_world, bool):
+            self._reload_world_between_episodes = raw_reload_world
+        else:
+            raise InvalidSimulatorRequest(
+                "reload_world_between_episodes must be true, false, or null"
+            )
+        self._physics_substepping = bool(self._config_value("physics_substepping"))
+        try:
+            self._physics_max_substep_delta_seconds = float(
+                self._config_value("physics_max_substep_delta_seconds")
+            )
+            raw_max_substeps = self._config_value("physics_max_substeps")
+            self._physics_max_substeps = int(raw_max_substeps)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise InvalidSimulatorRequest(
+                "physics substepping values must be finite positive numbers"
+            ) from exc
+        if (
+            not math.isfinite(self._physics_max_substep_delta_seconds)
+            or self._physics_max_substep_delta_seconds <= 0.0
+            or isinstance(raw_max_substeps, bool)
+            or self._physics_max_substeps <= 0
+            or float(raw_max_substeps) != self._physics_max_substeps
+        ):
+            raise InvalidSimulatorRequest(
+                "physics substepping values must be finite positive numbers"
+            )
+        substep_capacity = (
+            self._physics_max_substep_delta_seconds * self._physics_max_substeps
+        )
+        if self._physics_substepping and self._fixed_delta_seconds > substep_capacity:
+            message = (
+                "fixed_delta_seconds exceeds physics substepping capacity: "
+                f"{self._fixed_delta_seconds} > "
+                f"{self._physics_max_substep_delta_seconds} * {self._physics_max_substeps}"
+            )
+            raise InvalidSimulatorRequest(message)
+        if not self._physics_substepping:
+            raise InvalidSimulatorRequest(
+                "deterministic simulation requires physics_substepping=true"
+            )
         self._yaw_sign = float(self._config_value("yaw_sign"))
         self._yaw_offset_deg = float(self._config_value("yaw_offset_deg"))
-        if not self._sync:
-            raise InvalidSimulatorRequest(
-                "synchronous_mode must be true for the PISA absolute timestamp contract"
-            )
         if self._yaw_sign != -1.0 or self._yaw_offset_deg != 0.0:
             raise InvalidSimulatorRequest(
                 "PISA canonical coordinates require yaw_sign=-1.0 and yaw_offset_deg=0.0"
@@ -358,7 +452,19 @@ class CarlaAdapter:
         self._spawned_actor_ids: set[int] = set()
 
         self._scenario_runner_tm_port = int(os.environ.get("CARLA_TM_PORT", 8000))
-        self._scenario_runner_tm_seed = int(self._config_value("scenario_runner_tm_seed"))
+        raw_tm_seed = self._config_value("scenario_runner_tm_seed")
+        try:
+            self._scenario_runner_tm_seed = int(raw_tm_seed)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise InvalidSimulatorRequest("scenario_runner_tm_seed must be an integer") from exc
+        if (
+            isinstance(raw_tm_seed, bool)
+            or (isinstance(raw_tm_seed, Real) and raw_tm_seed != self._scenario_runner_tm_seed)
+            or not 0 <= self._scenario_runner_tm_seed <= (1 << 32) - 1
+        ):
+            raise InvalidSimulatorRequest(
+                "scenario_runner_tm_seed must be an integer between 0 and 4294967295"
+            )
 
         self._sr_scenario = None
         self._sr_tree = None
@@ -383,6 +489,13 @@ class CarlaAdapter:
                 "synchronous_mode": self._sync,
                 "no_rendering_mode": self._no_rendering,
                 "record": self._record,
+                "allow_async_world_lifecycle": self._allow_async_world_lifecycle,
+                "reload_world_between_episodes": self._reload_world_between_episodes,
+                "physics_substepping": self._physics_substepping,
+                "physics_max_substep_delta_seconds": (
+                    self._physics_max_substep_delta_seconds
+                ),
+                "physics_max_substeps": self._physics_max_substeps,
                 "open_scenario_map_loader": self._open_scenario_map_loader,
                 "yaw_sign": self._yaw_sign,
                 "yaw_offset_deg": self._yaw_offset_deg,
@@ -427,19 +540,36 @@ class CarlaAdapter:
             self._sr_last_tick_timestamp = None
             self._clear_post_reset_initialization_state()
             self._reset_episode_identity()
+            self._reset_random_sources()
 
             scenario_format = self.scenario.format
             is_open_scenario = scenario_format == "open_scenario1"
             use_scenario_runner_world_loading = is_open_scenario and (
-                getattr(self, "_open_scenario_map_loader", "scenario_runner") == "scenario_runner"
+                getattr(
+                    self,
+                    "_open_scenario_map_loader",
+                    DEFAULT_CONFIG["open_scenario_map_loader"],
+                )
+                == "scenario_runner"
             )
-            self._ensure_world(
+
+            # The deterministic default keeps cleanup and world loading synchronous.
+            # The compatibility escape hatch makes only lifecycle operations
+            # asynchronous; scenario execution always remains synchronous.
+            self._clear_dynamic_actors()
+            if not getattr(self, "_allow_async_world_lifecycle", False):
+                self._apply_world_settings()
+            self._world_generated_for_reset = self._ensure_world(
                 request.scenario_pack,
                 generate_opendrive_world=not use_scenario_runner_world_loading,
             )
-            self._clear_dynamic_actors()
             if not use_scenario_runner_world_loading:
-                self._apply_world_settings()
+                if is_open_scenario:
+                    # OpenScenarioConfiguration still performs final map validation;
+                    # any between-episode reload decision happens after that step.
+                    self._apply_world_settings()
+                else:
+                    self._prepare_world_for_scenario(register_data_provider=False)
 
             logger.info("Starting ScenarioRunner...")
             self._start_scenario_runner(request.scenario_pack, request.params)
@@ -471,6 +601,7 @@ class CarlaAdapter:
                 self._reset_episode_clock()
                 response = ResetResponse(frame=self._collect_runtime_frame(sim_time_ns=0))
                 self._clear_post_reset_initialization_state()
+            self._successful_reset_count = getattr(self, "_successful_reset_count", 0) + 1
             success = True
             return response
         except (AttributeError, NotImplementedError) as exc:
@@ -578,6 +709,29 @@ class CarlaAdapter:
     def _config_value(self, key: str):
         return (self.config or {}).get(key, DEFAULT_CONFIG[key])
 
+    def _reset_random_sources(self) -> None:
+        """Reset every wrapper-visible RNG at the start of an episode."""
+        seed = getattr(self, "_scenario_runner_tm_seed", DEFAULT_CONFIG["scenario_runner_tm_seed"])
+        random.seed(seed)
+        np.random.seed(seed)
+
+        if CarlaDataProvider is not None:
+            CarlaDataProvider._random_seed = seed
+            CarlaDataProvider._rng = np.random.RandomState(seed)
+
+    def _seed_world_randomness(self) -> None:
+        if self._world is None:
+            return
+        set_pedestrians_seed = getattr(self._world, "set_pedestrians_seed", None)
+        if set_pedestrians_seed is not None:
+            set_pedestrians_seed(
+                getattr(
+                    self,
+                    "_scenario_runner_tm_seed",
+                    DEFAULT_CONFIG["scenario_runner_tm_seed"],
+                )
+            )
+
     def _from_carla_yaw(self, yaw_deg: float) -> float:
         return math.radians((yaw_deg - self._yaw_offset_deg) * self._yaw_sign)
 
@@ -646,7 +800,7 @@ class CarlaAdapter:
         self,
         sps: ScenarioPackData | None,
         generate_opendrive_world: bool = True,
-    ) -> None:
+    ) -> bool:
         if sps is None:
             raise InvalidSimulatorRequest("ScenarioPack is required to prepare CARLA world")
 
@@ -660,7 +814,7 @@ class CarlaAdapter:
             if world is None:
                 raise SimulatorUnavailable("CARLA world is not available")
             self._world = world
-            return
+            return False
 
         opendrive_name = sps.map_name
         if not opendrive_name:
@@ -684,7 +838,7 @@ class CarlaAdapter:
                     opendrive_name,
                 )
                 self._world = world
-                return
+                return False
             # OpenDRIVE world generation can take minutes — bump the
             # client timeout, but guarantee it gets restored even if
             # generation raises (otherwise every subsequent CARLA call
@@ -704,6 +858,7 @@ class CarlaAdapter:
                             smooth_junctions=True,
                             enable_mesh_visibility=True,
                         ),
+                        False,
                     )
                 except Exception as exc:
                     raise InvalidSimulatorRequest(
@@ -720,6 +875,7 @@ class CarlaAdapter:
             world = self._client.get_world()
 
         self._world = world
+        return True
 
     @staticmethod
     def _opendrive_digest(opendrive: str) -> str:
@@ -786,14 +942,7 @@ class CarlaAdapter:
             raise SimulatorUnavailable("CARLA world is not available after ScenarioRunner setup")
 
         self._world = world
-        self._apply_world_settings()
-        CarlaDataProvider.set_client(self._client)
-        CarlaDataProvider.set_world(world)
-
-        if self._sync:
-            world.tick()
-        else:
-            world.wait_for_tick()
+        self._prepare_world_for_scenario(tick=True)
         self._sr_last_tick_timestamp = None
 
         town = getattr(config, "town", None)
@@ -817,13 +966,133 @@ class CarlaAdapter:
         if self._fixed_delta_seconds is not None:
             logger.info("Setting fixed_delta_seconds = %s", self._fixed_delta_seconds)
             settings.fixed_delta_seconds = float(self._fixed_delta_seconds)
+        settings.substepping = getattr(
+            self, "_physics_substepping", DEFAULT_CONFIG["physics_substepping"]
+        )
+        settings.max_substep_delta_time = getattr(
+            self,
+            "_physics_max_substep_delta_seconds",
+            DEFAULT_CONFIG["physics_max_substep_delta_seconds"],
+        )
+        settings.max_substeps = getattr(
+            self, "_physics_max_substeps", DEFAULT_CONFIG["physics_max_substeps"]
+        )
+        if hasattr(settings, "deterministic_ragdolls"):
+            settings.deterministic_ragdolls = True
         self._world.apply_settings(settings)
+
+    @staticmethod
+    def _world_identity(world) -> tuple[str | None, str | None]:
+        try:
+            carla_map = world.get_map()
+            map_name = carla_map.name.split("/")[-1]
+            if map_name == "OpenDriveMap":
+                return map_name, CarlaAdapter._opendrive_digest(carla_map.to_opendrive())
+            return map_name, None
+        except Exception as exc:
+            raise SimulatorUnavailable("Failed to capture CARLA world identity") from exc
+
+    def _reload_world_for_determinism(self) -> None:
+        if self._client is None or self._world is None:
+            raise SimulatorUnavailable("CARLA client/world is not available for reload")
+
+        expected_name, expected_digest = self._world_identity(self._world)
+        try:
+            traffic_manager = self._client.get_trafficmanager(
+                self._scenario_runner_tm_port
+            )
+            traffic_manager.set_synchronous_mode(False)
+            reloaded_world = self._client.reload_world(False)
+            if reloaded_world is None:
+                reloaded_world = self._client.get_world()
+        except Exception as exc:
+            message = str(exc).lower()
+            if "time-out" in message or "timeout" in message or "timed out" in message:
+                raise SimulatorTimeout("Timed out while reloading CARLA world") from exc
+            raise SimulatorUnavailable("CARLA world reload failed") from exc
+
+        if reloaded_world is None:
+            raise SimulatorUnavailable("CARLA returned no world after reload")
+        self._world = reloaded_world
+
+        actual_name, actual_digest = self._world_identity(reloaded_world)
+        if expected_name is not None and actual_name != expected_name:
+            raise SimulatorPreconditionFailed(
+                f"CARLA world changed during reload: {expected_name} -> {actual_name}"
+            )
+        if expected_digest is not None and actual_digest != expected_digest:
+            raise SimulatorPreconditionFailed(
+                "CARLA OpenDRIVE content changed during reload"
+            )
+
+        settings = reloaded_world.get_settings()
+        expected_settings = {
+            "synchronous_mode": self._sync,
+            "no_rendering_mode": self._no_rendering,
+            "fixed_delta_seconds": float(self._fixed_delta_seconds),
+            "substepping": self._physics_substepping,
+            "max_substep_delta_time": self._physics_max_substep_delta_seconds,
+            "max_substeps": self._physics_max_substeps,
+        }
+        if hasattr(settings, "deterministic_ragdolls"):
+            expected_settings["deterministic_ragdolls"] = True
+        mismatches = []
+        for name, expected in expected_settings.items():
+            actual = getattr(settings, name, None)
+            if isinstance(expected, float):
+                matches = actual is not None and math.isclose(
+                    float(actual), expected, rel_tol=0.0, abs_tol=1e-9
+                )
+            else:
+                matches = actual == expected
+            if not matches:
+                mismatches.append(f"{name}={actual!r} (expected {expected!r})")
+        if mismatches:
+            raise SimulatorUnavailable(
+                "CARLA did not preserve world settings across reload: "
+                + ", ".join(mismatches)
+            )
+
+    def _prepare_world_for_scenario(
+        self,
+        *,
+        tick: bool = False,
+        register_data_provider: bool = True,
+    ) -> None:
+        if self._world is None:
+            raise SimulatorUnavailable("CARLA world is not available")
+
+        self._apply_world_settings()
+        reload_enabled = getattr(self, "_reload_world_between_episodes", False)
+        has_previous_episode = getattr(self, "_successful_reset_count", 0) > 0
+        world_was_generated = getattr(self, "_world_generated_for_reset", False)
+        reloaded = False
+        if reload_enabled and has_previous_episode and not world_was_generated:
+            self._reload_world_for_determinism()
+            reloaded = True
+        elif reload_enabled:
+            reason = "freshly generated world" if world_was_generated else "first episode"
+            logger.info("Skipping redundant CARLA world reload for %s", reason)
+
+        self._seed_world_randomness()
+        if register_data_provider or reloaded:
+            CarlaDataProvider.set_client(self._client)
+            CarlaDataProvider.set_world(self._world)
+
+        if tick:
+            if self._sync:
+                self._world.tick()
+            else:
+                self._world.wait_for_tick()
 
     def _force_async_world_for_cleanup(self) -> None:
         force_async_world_for_cleanup(
             self._world,
             client=getattr(self, "_client", None),
             traffic_manager_port=getattr(self, "_scenario_runner_tm_port", 8000),
+            keep_synchronous=not getattr(
+                self, "_allow_async_world_lifecycle", False
+            ),
             log=logger,
         )
 
@@ -837,6 +1106,8 @@ class CarlaAdapter:
             logger.exception("Failed to get CARLA world while preparing reused server")
             return
 
+        if not getattr(self, "_allow_async_world_lifecycle", False):
+            self._apply_world_settings()
         self._clear_dynamic_actors()
 
     def _destroy_spawned_actors(self) -> None:
@@ -845,7 +1116,7 @@ class CarlaAdapter:
         spawned_actor_ids = getattr(self, "_spawned_actor_ids", set())
         world = getattr(self, "_world", None)
         if world is not None:
-            for actor_id in list(spawned_actor_ids):
+            for actor_id in sorted(spawned_actor_ids):
                 try:
                     actor = world.get_actor(actor_id)
                 except Exception:
@@ -871,6 +1142,9 @@ class CarlaAdapter:
             self._world,
             client=getattr(self, "_client", None),
             traffic_manager_port=getattr(self, "_scenario_runner_tm_port", 8000),
+            keep_synchronous=not getattr(
+                self, "_allow_async_world_lifecycle", False
+            ),
             log=logger,
         )
 
@@ -928,7 +1202,14 @@ class CarlaAdapter:
             raise InvalidSimulatorRequest(f"OpenSCENARIO file not found: {xosc_path}")
 
         config_client = self._client
-        if getattr(self, "_open_scenario_map_loader", "scenario_runner") == "wrapper":
+        if (
+            getattr(
+                self,
+                "_open_scenario_map_loader",
+                DEFAULT_CONFIG["open_scenario_map_loader"],
+            )
+            == "wrapper"
+        ):
             config_client = _WorldLoadingDisabledClient(self._client)
         config = OpenScenarioConfiguration(str(xosc_path), config_client, openscenario_params)
         configured_actors = list(getattr(config, "ego_vehicles", [])) + list(
@@ -1013,10 +1294,10 @@ class CarlaAdapter:
         tm = self._client.get_trafficmanager(self._scenario_runner_tm_port)
         self._traffic_manager = tm
         self._traffic_manager_sync_enabled = False
-        tm.set_random_device_seed(self._scenario_runner_tm_seed)
         if self._sync:
             tm.set_synchronous_mode(True)
             self._traffic_manager_sync_enabled = True
+        tm.set_random_device_seed(self._scenario_runner_tm_seed)
 
         self._snapshot_existing_actors()
 
@@ -1096,7 +1377,8 @@ class CarlaAdapter:
         if self._traffic_manager is None:
             return
 
-        if self._traffic_manager_sync_enabled:
+        keep_synchronous = not getattr(self, "_allow_async_world_lifecycle", False)
+        if self._traffic_manager_sync_enabled and not keep_synchronous:
             try:
                 self._traffic_manager.set_synchronous_mode(False)
                 logger.info("Restored TrafficManager synchronous mode")
@@ -1785,6 +2067,16 @@ class CarlaAdapter:
         with self._collision_lock:
             events = list(self._collision_events)
             self._collision_events.clear()
+
+        events.sort(
+            key=lambda event: (
+                event["frame"],
+                event.get("actor_entity_name") or "",
+                event.get("other_actor_entity_name") or "",
+                -1 if event["actor_id"] is None else event["actor_id"],
+                -1 if event["other_actor_id"] is None else event["other_actor_id"],
+            )
+        )
 
         collisions: list[CollisionInfoData] = []
         for event in events:

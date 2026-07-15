@@ -15,6 +15,7 @@ versions of the newer `pisa-api` Ping/Init contract.
 Init metadata contains CARLA `client_version` (when available), `server_version`,
 `host`, RPC `port`, `traffic_manager_port`, and a nested `config` allowlist with
 the effective values for `synchronous_mode`, `no_rendering_mode`, `record`,
+`allow_async_world_lifecycle`, `reload_world_between_episodes`, all physics substepping settings,
 `open_scenario_map_loader`, `yaw_sign`, `yaw_offset_deg`,
 `scenario_runner_tm_seed`, `ackermann_use_native_control`, all kinematic output
 deadbands, and all Ackermann controller gains, limits, launch thresholds, and
@@ -53,19 +54,41 @@ The wrapper expects these paths to be mounted in the container:
 
 Common config keys accepted by `InitRequest.config`:
 
-- `synchronous_mode`: Must be `true` so absolute PISA timestamps map to fixed
-  CARLA ticks.
 - `no_rendering_mode`: Enables CARLA no-rendering mode. Defaults to `true`.
 - `record`: Records each run to `carla_recording.log`. Defaults to `false`.
+- `allow_async_world_lifecycle`: Defaults to `false`, keeping cleanup and world
+  loading/generation synchronous. Set it to `true` only as a compatibility escape
+  hatch; scenario execution remains synchronous. Cleanup temporarily enables
+  no-rendering while idle. The deprecated `determinism_mode: strict` and
+  `determinism_mode: standard` values map to `false` and `true`, respectively.
+  Callback-arrived collision events use
+  stable ordering; the event's original `episode_frame` remains authoritative.
+  The asynchronous callback can still arrive in a later PISA response.
+- `reload_world_between_episodes`: controls the expensive world reload
+  independently. It is disabled when omitted, `null`, or `false`, because CARLA
+  0.9.16 can terminate the native Python client while
+  repeatedly reloading an OpenDRIVE world. Set it to `true` only as an explicit
+  opt-in. A newly started server's first episode and a freshly generated
+  OpenDRIVE world still skip the redundant reload.
+- `physics_substepping`: Explicitly enables physics substepping. Defaults to
+  `true` and must remain enabled.
+- `physics_max_substep_delta_seconds`: Maximum physics substep duration.
+  Defaults to `0.01` seconds.
+- `physics_max_substeps`: Maximum physics substeps per simulation tick. Defaults
+  to `10`. `dt` must be no greater than the product of this value and
+  `physics_max_substep_delta_seconds`.
 - `open_scenario_map_loader`: Selects who prepares the map for `open_scenario1`.
-  `scenario_runner` (default) preserves ScenarioRunner's native loading flow.
-  `wrapper` generates `/mnt/map/xodr/<ScenarioPackData.map_name>.xodr` first with
-  `wall_height=0.0`; ScenarioRunner may verify the map but is prevented from
+  `wrapper` (default) generates `/mnt/map/xodr/<ScenarioPackData.map_name>.xodr`
+  first with `wall_height=0.0` and `additional_width=5.6`; this normalizes map
+  generation across ScenarioRunner variants, including upstream releases that
+  otherwise generate 1 m road-edge walls. ScenarioRunner may verify the map but is prevented from
   replacing the generated world. The OpenSCENARIO `LogicFile` must reference the
   same OpenDRIVE content. Because `map_name` is only available on `ResetRequest`,
   the first reset after each `init()` generates the map. Later resets reuse it
   only when the current CARLA map is `OpenDriveMap` and its OpenDRIVE digest
   still matches; otherwise the wrapper regenerates the requested map.
+  `scenario_runner` remains available as a compatibility mode for native
+  `LogicFile` loading, including CARLA built-in towns.
 - `yaw_sign`: Must be `-1.0` for CARLA-left-handed to PISA-right-handed
   conversion.
 - `yaw_offset_deg`: Must be `0.0`; heading-only offsets are not a valid
@@ -74,7 +97,8 @@ Common config keys accepted by `InitRequest.config`:
   Defaults to `40`.
 - `retry_interval_seconds`: Delay between CARLA connection attempts. Defaults
   to `2`.
-- `scenario_runner_tm_seed`: TrafficManager random seed. Defaults to `0`.
+- `scenario_runner_tm_seed`: Episode random seed for Python, NumPy,
+  ScenarioRunner, CARLA pedestrians, and TrafficManager. Defaults to `0`.
 - `kinematic_speed_deadband_mps`,
   `kinematic_acceleration_deadband_mps2`,
   `kinematic_yaw_rate_deadband_radps`,
@@ -144,10 +168,10 @@ will prevent the launched CARLA server from starting correctly.
 
 ## Lifecycle
 
-During `init()`, the wrapper prepares a reused CARLA server by forcing the
-current world and TrafficManager out of synchronous mode and removing leftover
-dynamic actors. This keeps local development runs from inheriting vehicles or
-sync settings from an interrupted previous run.
+During `init()`, the wrapper prepares a reused CARLA server in synchronous
+no-rendering mode and removes leftover dynamic actors. When
+`allow_async_world_lifecycle=true`, only these lifecycle operations use
+asynchronous mode as a compatibility escape hatch.
 
 Each `reset()` finalizes any previous run before creating a new world and
 scenario. After the world is prepared, reset removes dynamic runtime actors
@@ -159,5 +183,4 @@ settings for each scenario instead.
 If reset fails partway through, the wrapper finalizes the partial state before
 re-raising the error. Finalization stops the CARLA recorder, destroys
 wrapper-spawned sensors/actors, stops ScenarioRunner, cleans ScenarioRunner
-global state, and restores TrafficManager synchronous mode when the wrapper
-enabled it.
+global state, and leaves the world and TrafficManager synchronous by default.

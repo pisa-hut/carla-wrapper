@@ -1,5 +1,4 @@
 #!/bin/bash
 
-pushd /app
-uv run python -m carla_wrapper.server
-popd
+cd /app || exit 1
+exec /app/.venv/bin/python -X faulthandler -m carla_wrapper.server
