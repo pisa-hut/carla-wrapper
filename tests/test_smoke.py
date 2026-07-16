@@ -308,7 +308,6 @@ def test_finalize_destroys_collision_sensor_before_scenario_runner_cleanup() -> 
     adapter._client = SimpleNamespace(stop_recorder=lambda: calls.append("stop_recorder"))
     adapter._destroy_spawned_actors = lambda: calls.append("destroy_spawned_actors")
     adapter._stop_scenario_runner_module = lambda: calls.append("stop_scenario_runner")
-    adapter._clear_dynamic_actors = lambda: calls.append("clear_dynamic_actors")
 
     adapter._finalize()
 
@@ -316,7 +315,6 @@ def test_finalize_destroys_collision_sensor_before_scenario_runner_cleanup() -> 
         "stop_recorder",
         "destroy_spawned_actors",
         "stop_scenario_runner",
-        "clear_dynamic_actors",
     ]
     assert adapter._finalized is True
 
@@ -332,14 +330,12 @@ def test_finalize_continues_after_recorder_stop_failure() -> None:
     )
     adapter._destroy_spawned_actors = lambda: calls.append("destroy_spawned_actors")
     adapter._stop_scenario_runner_module = lambda: calls.append("stop_scenario_runner")
-    adapter._clear_dynamic_actors = lambda: calls.append("clear_dynamic_actors")
 
     adapter._finalize()
 
     assert calls == [
         "destroy_spawned_actors",
         "stop_scenario_runner",
-        "clear_dynamic_actors",
     ]
     assert adapter._finalized is True
 
@@ -380,7 +376,7 @@ def test_finalize_clears_dynamic_actors_and_leaves_server_async() -> None:
     adapter._scenario_runner_tm_port = 8000
     adapter._allow_async_world_lifecycle = True
     adapter._destroy_spawned_actors = lambda: None
-    adapter._stop_scenario_runner_module = lambda: None
+    adapter._stop_scenario_runner_module = adapter._clear_dynamic_actors
 
     adapter._finalize()
 
@@ -415,6 +411,61 @@ def test_strict_cleanup_keeps_world_and_traffic_manager_synchronous() -> None:
     assert world.settings.fixed_delta_seconds == 0.05
     assert world.settings.no_rendering_mode is True
     assert traffic_manager.sync_calls == [True]
+
+
+def test_cleanup_batch_destroys_sorted_dynamic_actors(monkeypatch) -> None:
+    from carla_wrapper import simulation
+
+    class Sensor(_FakeActor):
+        def __init__(self, actor_id):
+            super().__init__(actor_id, type_id="sensor.other.collision")
+            self.stop_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+
+    class BatchClient:
+        def __init__(self, traffic_manager):
+            self.traffic_manager = traffic_manager
+            self.batch_calls = []
+
+        def get_trafficmanager(self, port):
+            return self.traffic_manager
+
+        def apply_batch_sync(self, commands, do_tick):
+            self.batch_calls.append((commands, do_tick))
+            return [SimpleNamespace(has_error=lambda: False) for _ in commands]
+
+    monkeypatch.setattr(
+        simulation,
+        "carla",
+        SimpleNamespace(
+            command=SimpleNamespace(DestroyActor=lambda actor_id: ("destroy", actor_id))
+        ),
+    )
+    sensor = Sensor(3)
+    vehicle = _FakeActor(actor_id=2, type_id="vehicle.tesla.model3")
+    traffic_light = _FakeActor(actor_id=1, type_id="traffic.traffic_light")
+    world = _FakeSettingsWorld(
+        [sensor, traffic_light, vehicle],
+        synchronous_mode=True,
+        fixed_delta_seconds=0.05,
+    )
+    traffic_manager = _FakeTrafficManager()
+    client = BatchClient(traffic_manager)
+    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
+    adapter._allow_async_world_lifecycle = False
+    adapter._world = world
+    adapter._client = client
+    adapter._scenario_runner_tm_port = 8000
+
+    adapter._clear_dynamic_actors()
+
+    assert client.batch_calls == [([("destroy", 2), ("destroy", 3)], False)]
+    assert sensor.stop_calls == 1
+    assert sensor.destroy_calls == 0
+    assert vehicle.destroy_calls == 0
+    assert traffic_light.destroy_calls == 0
 
 
 def test_strict_cleanup_does_not_restore_traffic_manager_to_async() -> None:
@@ -1794,10 +1845,56 @@ def test_scenario_runner_cleanup_cleans_globals_even_when_not_running(monkeypatc
     adapter._sr_scenario = None
     adapter._sr_tree = None
     adapter._sr_ego_vehicles = []
+    adapter._clear_dynamic_actors = lambda: calls.append("batch_actor_cleanup")
 
     adapter._stop_scenario_runner_module()
 
-    assert calls == ["restore_tm", "data_provider_cleanup", "blackboard_clear"]
+    assert calls == [
+        "restore_tm",
+        "batch_actor_cleanup",
+        "data_provider_cleanup",
+        "blackboard_clear",
+    ]
+
+
+def test_scenario_runner_cleanup_batches_before_clearing_provider(monkeypatch) -> None:
+    from carla_wrapper import simulation
+
+    calls = []
+    scenario = SimpleNamespace(
+        terminate=lambda: calls.append("terminate"),
+        remove_all_actors=lambda: calls.append("individual_actor_cleanup"),
+    )
+    monkeypatch.setattr(
+        simulation,
+        "CarlaDataProvider",
+        SimpleNamespace(cleanup=lambda: calls.append("data_provider_cleanup")),
+    )
+    monkeypatch.setattr(
+        simulation,
+        "py_trees",
+        SimpleNamespace(
+            blackboard=SimpleNamespace(
+                Blackboard=SimpleNamespace(_Blackboard__shared_state=_FakeSharedState(calls))
+            )
+        ),
+    )
+    adapter = simulation.CarlaAdapter.__new__(simulation.CarlaAdapter)
+    adapter._restore_traffic_manager_settings = lambda: calls.append("restore_tm")
+    adapter._sr_scenario = scenario
+    adapter._sr_tree = None
+    adapter._sr_ego_vehicles = []
+    adapter._clear_dynamic_actors = lambda: calls.append("batch_actor_cleanup")
+
+    adapter._stop_scenario_runner_module()
+
+    assert calls == [
+        "restore_tm",
+        "terminate",
+        "batch_actor_cleanup",
+        "data_provider_cleanup",
+        "blackboard_clear",
+    ]
 
 
 def test_stop_does_not_call_carla_after_finalize() -> None:

@@ -655,7 +655,6 @@ class CarlaAdapter:
 
         self._destroy_spawned_actors()
         self._stop_scenario_runner_module()
-        self._clear_dynamic_actors()
 
         self._finalized = True
         logger.info("CARLA service finalized.")
@@ -1095,19 +1094,11 @@ class CarlaAdapter:
         self._clear_dynamic_actors()
 
     def _destroy_spawned_actors(self) -> None:
-        self._destroy_collision_sensor()
+        # Stop callback producers first, but leave destruction to the single
+        # sorted batch in _clear_dynamic_actors().
+        self._destroy_collision_sensor(destroy=False)
 
         spawned_actor_ids = getattr(self, "_spawned_actor_ids", set())
-        world = getattr(self, "_world", None)
-        if world is not None:
-            for actor_id in sorted(spawned_actor_ids):
-                try:
-                    actor = world.get_actor(actor_id)
-                except Exception:
-                    logger.exception("Failed to get spawned actor %s for cleanup", actor_id)
-                    continue
-                destroy_actor(actor, log=logger, label="spawned actor")
-
         spawned_actor_ids.clear()
         self._objects_by_id.clear()
         self._prev_yaw_rate.clear()
@@ -1127,6 +1118,7 @@ class CarlaAdapter:
             client=getattr(self, "_client", None),
             traffic_manager_port=getattr(self, "_scenario_runner_tm_port", 8000),
             keep_synchronous=not getattr(self, "_allow_async_world_lifecycle", False),
+            destroy_actor_command=getattr(getattr(carla, "command", None), "DestroyActor", None),
             log=logger,
         )
 
@@ -1324,17 +1316,10 @@ class CarlaAdapter:
             except Exception:
                 logger.exception("Failed to terminate scenario")
 
-            try:
-                if self._sr_scenario is not None:
-                    self._sr_scenario.remove_all_actors()
-                    logger.info("Scenario actors removed successfully")
-            except Exception:
-                logger.exception("Failed to remove ScenarioRunner actors")
-
-        if self._sr_scenario is None:
-            for actor in self._sr_ego_vehicles:
-                destroy_actor(actor, log=logger, label="partially spawned ego actor")
-            self._destroy_new_scenario_actors()
+        # BasicScenario.remove_all_actors() destroys actors one RPC at a time.
+        # Keep every remaining scenario/sensor actor alive until this point so
+        # the wrapper can submit one deterministic, sorted destruction batch.
+        self._clear_dynamic_actors()
 
         # Clean up data provider
         try:
@@ -1994,7 +1979,7 @@ class CarlaAdapter:
             logger.exception("Failed to attach collision sensor to ego vehicle")
             self._collision_sensor = None
 
-    def _destroy_collision_sensor(self) -> None:
+    def _destroy_collision_sensor(self, *, destroy: bool = True) -> None:
         sensor = self._collision_sensor
         self._collision_sensor = None
         if sensor is None:
@@ -2009,7 +1994,8 @@ class CarlaAdapter:
             self._spawned_actor_ids.discard(sensor.id)
         except Exception:
             logger.exception("Failed to untrack collision sensor")
-        destroy_actor(sensor, log=logger, label="collision sensor")
+        if destroy:
+            destroy_actor(sensor, log=logger, label="collision sensor")
 
     def _clear_collision_events(self) -> None:
         with self._collision_lock:
