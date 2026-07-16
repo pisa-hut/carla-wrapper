@@ -101,7 +101,7 @@ DEFAULT_CONFIG = {
     "no_rendering_mode": True,
     "record": False,
     "allow_async_world_lifecycle": False,
-    "reload_world_between_episodes": None,
+    "reload_world_between_episodes": False,
     "physics_substepping": True,
     "physics_max_substep_delta_seconds": 0.01,
     "physics_max_substeps": 10,
@@ -372,12 +372,11 @@ class CarlaAdapter:
         raw_reload_world = self._config_value("reload_world_between_episodes")
         if raw_reload_world is None:
             self._reload_world_between_episodes = False
+            logger.warning("reload_world_between_episodes=null is deprecated; use false")
         elif isinstance(raw_reload_world, bool):
             self._reload_world_between_episodes = raw_reload_world
         else:
-            raise InvalidSimulatorRequest(
-                "reload_world_between_episodes must be true, false, or null"
-            )
+            raise InvalidSimulatorRequest("reload_world_between_episodes must be true or false")
         self._physics_substepping = bool(self._config_value("physics_substepping"))
         try:
             self._physics_max_substep_delta_seconds = float(

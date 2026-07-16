@@ -21,11 +21,10 @@ record: false
 allow_async_world_lifecycle: false
 
 # Control the expensive world reload independently from lifecycle synchronization.
-# - null (default): disabled.
-# - true/false: explicitly enable or disable it.
+# Keep false for map reuse; set true only to explicitly reload between episodes.
 # A newly started server's first episode and a freshly generated OpenDRIVE world
 # are already clean and therefore skip the redundant reload.
-reload_world_between_episodes: null
+reload_world_between_episodes: false
 
 # Explicit physics substepping. These defaults match CARLA's recommended values
 # and add no extra work compared with CARLA's default physics configuration.

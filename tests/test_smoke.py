@@ -612,7 +612,7 @@ def test_init_rejects_unknown_open_scenario_map_loader() -> None:
         (
             {"reload_world_between_episodes": "sometimes"},
             0.05,
-            "reload_world_between_episodes must be true, false, or null",
+            "reload_world_between_episodes must be true or false",
         ),
         (
             {"physics_substepping": False},

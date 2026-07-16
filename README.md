@@ -65,11 +65,12 @@ Common config keys accepted by `InitRequest.config`:
   stable ordering; the event's original `episode_frame` remains authoritative.
   The asynchronous callback can still arrive in a later PISA response.
 - `reload_world_between_episodes`: controls the expensive world reload
-  independently. It is disabled when omitted, `null`, or `false`, because CARLA
-  0.9.16 can terminate the native Python client while
+  independently. It defaults to `false`, because CARLA 0.9.16 can terminate the
+  native Python client while
   repeatedly reloading an OpenDRIVE world. Set it to `true` only as an explicit
   opt-in. A newly started server's first episode and a freshly generated
-  OpenDRIVE world still skip the redundant reload.
+  OpenDRIVE world still skip the redundant reload. The legacy `null` value is
+  temporarily accepted as deprecated `false`.
 - `physics_substepping`: Explicitly enables physics substepping. Defaults to
   `true` and must remain enabled.
 - `physics_max_substep_delta_seconds`: Maximum physics substep duration.
